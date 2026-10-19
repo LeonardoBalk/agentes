@@ -297,16 +297,117 @@ class CoreTests(unittest.TestCase):
             return dict(mode='ai')
         pronto=dict(ready=True,model='gemini/x',base_url=None)
         with patch.object(agente,'ai_status',return_value=pronto),patch.object(agente,'rodar_uma_vez',side_effect=instavel),\
-             patch.object(agente.time,'sleep') as espera:
-            self.assertEqual(agente.run_agent({},{},[],None),dict(mode='ai'))
+             patch.object(agente,'reservas_configuradas',return_value=[]),patch.object(agente.time,'sleep') as espera:
+            self.assertEqual(agente.run_agent({},{},[],None),dict(mode='ai',engine='CrewAI / gemini/x'))
             self.assertEqual(len(chamadas),3)
             self.assertEqual([c.args[0] for c in espera.call_args_list],[5,15])
-        with patch.object(agente,'ai_status',return_value=pronto),\
+        with patch.object(agente,'ai_status',return_value=pronto),patch.object(agente,'reservas_configuradas',return_value=[]),\
              patch.object(agente,'rodar_uma_vez',side_effect=RuntimeError('404 NOT_FOUND segredo-do-provedor')):
             with self.assertRaises(AgentError) as ctx:
                 agente.run_agent({},{},[],None)
             self.assertNotIn('segredo-do-provedor',str(ctx.exception))
             self.assertIn('não está disponível',str(ctx.exception))
+
+    def test_fallback_chain_uses_the_next_model_and_records_why(self):
+        pronto=dict(ready=True,model='gemini/principal',base_url=None)
+        reservas=[dict(tipo='crewai',model='gemini/lite',label='CrewAI / gemini/lite (reserva)'),
+                  dict(tipo='groq',model='openai/gpt-oss-120b',label='Groq / openai/gpt-oss-120b (reserva, dados resumidos)')]
+        modelos=[]
+        def crewai(dataset,scenario,sources,project,status):
+            modelos.append(status['model'])
+            raise RuntimeError('503 UNAVAILABLE high demand')
+        def groq(dataset,scenario,sources,project,modelo,label):
+            modelos.append(modelo)
+            return dict(mode='ai',summary='ok',priorities=[],questions=[],source_ids=[],tool_log=[])
+        with patch.object(agente,'ai_status',return_value=pronto),patch.object(agente,'reservas_configuradas',return_value=reservas),\
+             patch.object(agente,'rodar_uma_vez',side_effect=crewai),patch.object(agente,'rodar_groq',side_effect=groq),\
+             patch.object(agente.time,'sleep'):
+            r=agente.run_agent({},{},[],None)
+        # O principal e o Gemini reserva tentam 3 vezes cada (erro passageiro); o Groq responde.
+        self.assertEqual(modelos,['gemini/principal']*3+['gemini/lite']*3+['openai/gpt-oss-120b'])
+        self.assertIn('Groq',r['engine'])
+        self.assertEqual([f['engine'] for f in r['fallback']['failures']],['CrewAI / gemini/principal','CrewAI / gemini/lite (reserva)'])
+        self.assertIn('alta demanda',r['fallback']['failures'][0]['reason'])
+
+    def test_daily_quota_skips_retries_and_goes_straight_to_the_reserve(self):
+        pronto=dict(ready=True,model='gemini/principal',base_url=None)
+        reservas=[dict(tipo='groq',model='openai/gpt-oss-120b',label='Groq / reserva')]
+        cota=RuntimeError('429 RESOURCE_EXHAUSTED Quota exceeded ... Please retry in 10h10m50.3s.')
+        with patch.object(agente,'ai_status',return_value=pronto),patch.object(agente,'reservas_configuradas',return_value=reservas),\
+             patch.object(agente,'rodar_uma_vez',side_effect=cota) as principal,\
+             patch.object(agente,'rodar_groq',return_value=dict(mode='ai',tool_log=[])),\
+             patch.object(agente.time,'sleep') as espera:
+            r=agente.run_agent({},{},[],None)
+        self.assertEqual(principal.call_count,1)   # não gasta mais requisições de uma cota que acabou
+        espera.assert_not_called()
+        self.assertIn('10 h 10 min',r['fallback']['failures'][0]['reason'])
+        mensagem,temporario=classificar_erro(RuntimeError('429 rate limit. Please try again in 7.6s'),'groq/x')
+        self.assertTrue(temporario)   # limite por minuto continua sendo passageiro
+
+    def test_all_models_failing_raises_without_leaking_provider_text(self):
+        pronto=dict(ready=True,model='gemini/principal',base_url=None)
+        reservas=[dict(tipo='groq',model='openai/gpt-oss-120b',label='Groq / reserva')]
+        with patch.object(agente,'ai_status',return_value=pronto),patch.object(agente,'reservas_configuradas',return_value=reservas),\
+             patch.object(agente,'rodar_uma_vez',side_effect=RuntimeError('401 API key not valid segredo')),\
+             patch.object(agente,'rodar_groq',side_effect=RuntimeError('404 model_not_found segredo')):
+            with self.assertRaises(AgentError) as ctx:
+                agente.run_agent({},{},[],None)
+        texto=str(ctx.exception)
+        self.assertIn('Nenhum modelo concluiu',texto)
+        self.assertIn('Groq / reserva',texto)
+        self.assertNotIn('segredo',texto)
+
+    def test_reserves_come_from_env(self):
+        with patch.dict('os.environ',{},clear=True):
+            self.assertEqual(agente.reservas_configuradas(),[])
+        with patch.dict('os.environ',{'LLM_RESERVA_MODEL':'gemini/gemini-3.5-flash-lite','GROQ_API_KEY':'gsk_teste'},clear=True):
+            r=agente.reservas_configuradas()
+            self.assertEqual([x['tipo'] for x in r],['crewai','groq'])
+            self.assertEqual(r[1]['model'],'openai/gpt-oss-120b')
+            self.assertEqual(agente.redigir('chave gsk_teste no log'),'chave *** no log')
+
+    def test_compact_tool_outputs_fit_the_groq_limit(self):
+        scenario=simulate(self.data)
+        fontes=[dict(id='lrf',title='LRF',status='consultada',
+                     dispositivos=[dict(dispositivo=f'Art. {n}',trecho='x'*2500) for n in (14,19,20,22,42)])]
+        projeto=dict(answers=['resposta longa '*40]*11)
+        tamanho=sum(len(json.dumps(x,ensure_ascii=False)) for x in (
+            agente.resumir_indicadores(self.data,projeto),agente.resumir_simulacao(scenario),agente.resumir_fontes(fontes)))
+        # Cerca de 3,2 caracteres por token: precisa ficar bem abaixo dos 7.000 tokens por minuto.
+        self.assertLess(tamanho/3.2,5000)
+        ids={a['id'] for a in agente.resumir_simulacao(scenario)['actions']}
+        self.assertEqual(ids,{a['id'] for a in scenario['actions']})
+
+    def test_groq_loop_forces_the_three_tools_and_a_json_answer(self):
+        scenario=simulate(self.data)
+        fontes=[dict(id='lrf',title='LRF',status='consultada',dispositivos=[])]
+        pedidos=[]
+        class Uso: total_tokens=100
+        class Chamada:
+            def __init__(self,i,nome):
+                self.id=f'c{i}'; self.function=type('F',(),{'name':nome,'arguments':'{}'})()
+            def model_dump(self):
+                return dict(id=self.id,type='function',function=dict(name=self.function.name,arguments='{}'))
+        def resposta(mensagem):
+            return type('R',(),{'choices':[type('C',(),{'message':mensagem})()],'usage':Uso()})()
+        final=json.dumps(dict(summary='Resumo da análise com propostas.',
+            priorities=[dict(action_id=a['id'],reason='Conferir premissas e custos.') for a in scenario['actions']],
+            questions=['Quais cargos podem sair?'],source_ids=['lrf']))
+        class Cliente:
+            def __init__(self,**kw): self.chat=self; self.completions=self
+            def create(self,**kw):
+                pedidos.append(kw)
+                if kw['tool_choice']=='required':
+                    nomes=['consultar_indicadores','consultar_simulacao','consultar_fontes_oficiais']
+                    return resposta(type('M',(),{'content':None,'tool_calls':[Chamada(i,n) for i,n in enumerate(nomes)]})())
+                return resposta(type('M',(),{'content':final,'tool_calls':None})())
+        import openai
+        with patch.object(openai,'OpenAI',Cliente),patch.dict('os.environ',{'GROQ_API_KEY':'gsk_teste'}):
+            r=agente.rodar_groq(self.data,scenario,fontes,None,'openai/gpt-oss-120b','Groq / teste')
+        self.assertEqual([p['tool_choice'] for p in pedidos],['required','none'])
+        self.assertEqual(pedidos[-1]['response_format'],{'type':'json_object'})
+        self.assertEqual({c['tool'] for c in r['tool_log']},agente.FERRAMENTAS_OBRIGATORIAS)
+        self.assertEqual(r['engine'],'Groq / teste')
 
     def test_missing_external_sources_remain_unavailable(self):
         with tempfile.TemporaryDirectory() as temp:
