@@ -69,6 +69,8 @@ function showPage(page) {
     if (active) el.setAttribute('aria-current', 'page'); else el.removeAttribute('aria-current');
   });
   $('#stepper-box').hidden = page === 'project';
+  const passo = { data: 1, simulation: 2, review: 3 }[page];
+  if (passo) $('#step-count').textContent = `Passo ${passo} de 3`;
   $$('#stepper button').forEach(el => {
     const current = el.dataset.page === page;
     el.classList.toggle('current', current);
@@ -79,21 +81,36 @@ function showPage(page) {
 }
 
 
+// Resumo do topo: o resultado em destaque e os principais problemas; os detalhes ficam nos cartões abaixo.
 function renderMetrics() {
   const m = state.dataset.metrics;
+  const findings = state.dataset.situation;
+  const problemas = findings.filter(f => f.severity === 'alerta' && f.id !== 'resultado').slice(0, 4);
+  const negativo = m.balance < 0;
+  $('#summary').innerHTML = `
+    <div class="summary-main ${negativo ? 'negative' : ''}">
+      <div class="tile-label">RESULTADO DO ANO</div>
+      <div class="summary-value">${brl(m.balance)}</div>
+      <p>${negativo ? 'A despesa liquidada' : 'A receita arrecadada'} (${brl(negativo ? m.expenses : m.revenue)}) superou ${negativo ? 'a receita arrecadada' : 'a despesa liquidada'} (${brl(negativo ? m.revenue : m.expenses)}). É um saldo simples: não é caixa nem resultado primário.</p>
+    </div>
+    <div class="summary-side">
+      <div class="tile-label">PRINCIPAIS PROBLEMAS</div>
+      <ul class="summary-list">${problemas.map(f => `<li><span>${esc(f.title)}</span><strong class="${tone(f)}">${FORMAT[f.kind](f.value)}</strong></li>`).join('')}</ul>
+      <p class="field-hint">Vermelho: déficit. Laranja: arrecadação abaixo do previsto. Preto: valor a receber, como a dívida ativa. Cada ponto está explicado nos cartões abaixo.</p>
+    </div>`;
+  const folha = findings.find(f => f.id === 'peso_da_folha');
   const tiles = [
-    ['Receita arrecadada', m.revenue, 'O que a prefeitura arrecadou em 12 meses', false],
-    ['Despesa liquidada', m.expenses, 'Serviço ou compra já entregue; pode ainda não ter sido paga. O período exato precisa ser confirmado', false],
-    ['Resultado do ano', m.balance, m.balance < 0 ? 'A despesa liquidada superou a receita arrecadada' : 'A receita arrecadada superou a despesa liquidada', m.balance < 0],
-    ['Dívida ativa', m.debt_stock, 'A receber de quem não pagou; não é dinheiro em caixa', false],
+    ['Receita arrecadada', brl(m.revenue), 'Em 12 meses'],
+    ['Despesa liquidada', brl(m.expenses), 'Entregue, nem sempre já paga'],
+    ['Dívida ativa', brl(m.debt_stock), 'A receber; não é caixa'],
+    ['Folha sobre a receita', folha ? pct(folha.value) : '—', 'Razão simples, não é o teste da LRF'],
   ];
-  $('#metrics').innerHTML = tiles.map(([label, value, note, negative]) => `
-    <div class="tile ${negative ? 'negative' : ''}">
+  $('#metrics').innerHTML = tiles.map(([label, value, note]) => `
+    <div class="tile metric">
       <div class="tile-label">${esc(label)}</div>
-      <div class="tile-value">R$ ${num(value / 1e6)} <small>mi</small></div>
+      <div class="metric-value">${value}</div>
       <p class="field-hint">${esc(note)}</p>
     </div>`).join('');
-
 }
 
 const SEVERITY = {
@@ -102,19 +119,23 @@ const SEVERITY = {
   info: { label: 'Informativo', kind: 'blue' },
 };
 const FORMAT = { money: brl, percent: pct };
+// Cor do valor pelo tipo de problema: déficit, arrecadação abaixo do previsto ou estoque a receber.
+const TONE = { resultado: 'deficit', despesa_acima_da_dotacao: 'deficit', receita_abaixo_do_previsto: 'shortfall',
+  convenios_e_obras: 'shortfall', divida_ativa: 'stock' };
+const tone = f => 'tone-' + (TONE[f.id] || 'neutral');
 
 function renderSituation() {
   const findings = state.dataset.situation;
   const alerts = findings.filter(f => f.severity === 'alerta').length;
   $('#situation-count').textContent = `${alerts} alertas em ${findings.length} pontos`;
-  $('#situation').innerHTML = findings.map(f => {
+  $('#situation').innerHTML = findings.filter(f => f.id !== 'resultado').map(f => {
     const severity = SEVERITY[f.severity];
     const items = f.items.length
       ? `<ul>${f.items.map(i => `<li><span>${esc(i.label)}</span><strong>${FORMAT[i.kind](i.value)}</strong></li>`).join('')}</ul>`
       : '';
     return `<div class="tile finding ${esc(f.severity)}">
       <div class="tile-header"><div class="tile-label">${esc(f.title).toUpperCase()}</div>${tag(severity.label, severity.kind)}</div>
-      <div class="tile-value">${FORMAT[f.kind](f.value)}</div>
+      <div class="tile-value ${tone(f)}">${FORMAT[f.kind](f.value)}</div>
       <p>${esc(f.note)}</p>${items}
       <span class="cell-ref">${esc(f.source)}</span>
     </div>`;
@@ -181,8 +202,46 @@ function renderSources() {
 const SLIDERS = ['recovery_pct', 'admin_pct', 'environment_pct', 'security_pct',
   'das_cut_pct', 'attrition_pct', 'temp_saving_pct', 'refis_adhesion_pct', 'refis_discount_pct'];
 
+const ONE_TIME = new Set(['recuperar_divida', 'refis_iptu']);
+
+// Mostra no fim de cada bloco quanto a proposta rende com os valores escolhidos.
+function renderLeverEffects() {
+  for (const el of $$('[data-effect]')) {
+    const a = scenario.actions.find(x => x.id === el.dataset.effect);
+    if (!a) continue;
+    const negative = a.net < 0;
+    let text = ONE_TIME.has(a.id)
+      ? `Rende ${brl(a.net)} uma vez, no ano 1, já descontado o custo.`
+      : `Rende ${brl(a.yearly[1])} por ano a partir do ano 2 (${brl(a.net)} no ano 1, já descontado o custo).`;
+    if (a.id === 'reduzir_folha') {
+      const m = state.dataset.metrics;
+      const cargos = Math.round(m.das_count * Number($('#das_cut_pct').value) / 100);
+      text += ` Equivale a cerca de ${cargos} dos ${m.das_count} cargos, pelo custo médio.`;
+    }
+    el.textContent = text;
+    el.classList.toggle('negative-text', negative);
+  }
+}
+
+function renderLeverBases() {
+  for (const el of $$('[data-base]')) {
+    const d = state.dataset.departments.find(x => x.id === el.dataset.base);
+    if (d) el.textContent = `(base ${brl(d.eligible)})`;
+  }
+}
+
+// Resumo das opções avançadas, visível mesmo com a seção fechada.
+function renderAdvancedSummary() {
+  const costs = ['collection_cost', 'savings_cost', 'das_cost', 'refis_cost'].reduce((sum, k) => sum + (Number($('#' + k).value) || 0), 0);
+  const attrition = Number($('#attrition_pct').value);
+  const saving = Number($('#temp_saving_pct').value);
+  const temporarios = attrition > 0 && saving > 0 ? `ligada (${num(attrition)}% saem por ano, ${num(saving)}% de economia)` : 'desligada';
+  $('#advanced-summary').textContent = `Custos: ${brl(costs)} no total · Reposição por temporários: ${temporarios}`;
+}
+
 function updateOutputs() {
   for (const key of SLIDERS) $('#out-' + key).textContent = num(Number($('#' + key).value)) + '%';
+  renderAdvancedSummary();
 }
 
 function getInputs() {
@@ -270,7 +329,22 @@ function renderScenario() {
     </div>
     <div class="notice"><strong>Restrições do cliente</strong>
       <ul class="detail-list">${s.constraints.map(c => `<li>${esc(c.text)}</li>`).join('')}</ul></div>`;
+  renderSticky();
+  renderLeverEffects();
   annotate($('#scenario-results'));
+}
+
+// Painel fixo: resultado, meta e cobertura continuam visíveis enquanto os controles rolam.
+function renderSticky() {
+  const s = scenario;
+  const o = s.objective;
+  const r = s.recurring;
+  const box = $('#sim-sticky');
+  box.className = 'sim-sticky ' + (o ? (o.meets ? 'good' : 'bad') : '');
+  box.innerHTML = `
+    <div><span class="tile-label">Resultado em 12 meses</span><span class="sticky-value ${s.projected_balance < 0 ? 'tone-deficit' : ''}">${brl(s.projected_balance)}</span></div>
+    <div><span class="tile-label">Meta dos 10 anos</span><span class="sticky-value">${o ? (o.meets ? 'Atendida' : `Não atendida (déficit no ano ${o.first_deficit_year})`) : '—'}</span></div>
+    <div><span class="tile-label">Déficit recorrente coberto</span><span class="sticky-value">${r && r.coverage !== null ? pct(r.coverage) : '—'}</span></div>`;
 }
 
 async function updateScenario() {
@@ -297,7 +371,7 @@ async function updateScenario() {
 function renderAI() {
   const a = state.ai;
   $('#ai-status').textContent = a.ready
-    ? `Agente de IA disponível (${a.model}). Os números agregados, as respostas da entrevista e os trechos das fontes oficiais são enviados ao Google.`
+    ? `Agente de IA disponível (${a.model}).${a.fallbacks && a.fallbacks.length ? ` Se ele falhar, o app tenta: ${a.fallbacks.join(' → ')}.` : ''} Os números agregados, as respostas da entrevista e os trechos das fontes oficiais são enviados ao provedor do modelo que responder.`
     : 'O agente de IA ainda não está ligado. Preencha LLM_API_KEY (chave do Gemini) no arquivo .env e reinicie o app. Enquanto isso, use as regras fixas.';
   $('#run-mode option[value="ai"]').disabled = !a.ready;
 }
@@ -355,13 +429,20 @@ function renderAnalysisCard(run) {
     : 'Nenhuma ferramenta de agente executada. Os cálculos foram feitos diretamente em Python.';
   const sources = analysis.source_ids.length ? analysis.source_ids.map(esc).join(', ') : 'nenhuma';
   return `
-    <div class="tile">
+    <div class="tile analysis">
       <div class="tile-header"><h2>${isAI ? 'O que o agente de IA concluiu' : 'Leitura pelas regras fixas'}</h2>${tag(analysis.engine, 'blue')}</div>
-      <p>${esc(analysis.summary)}</p>
-      <div class="notice"><strong>Passos do agente</strong><p>${steps}</p></div>
-      <details class="accordion"><summary>Pontos em aberto para a implementação</summary>
-        <div class="body"><ul>${analysis.questions.map(q => `<li>${esc(q)}</li>`).join('')}</ul>
-        <p class="field-hint">Fontes consultadas citadas: ${sources}. O snapshot das fontes está no JSON desta análise.</p></div>
+      ${analysis.fallback ? `<div class="notice warning"><strong>Feita por um modelo reserva</strong>
+        <p>${analysis.fallback.failures.map(f => `${esc(f.engine)}: ${esc(f.reason)}`).join('<br>')}</p>
+        <p>Quem respondeu: ${esc(analysis.engine)}.${analysis.engine.includes('resumidos') ? ' Esse modelo recebe uma versão resumida dos dados, então o texto tende a ser menos detalhado. Os números e a validação são os mesmos.' : ''}</p></div>` : ''}
+      <p class="analysis-summary">${esc(analysis.summary)}</p>
+      <details class="accordion analysis-more"><summary>Ler análise completa</summary>
+        <div class="body">
+          <h3>Pontos em aberto para a implementação</h3>
+          <ul class="detail-list">${analysis.questions.map(q => `<li>${esc(q)}</li>`).join('')}</ul>
+          <h3>Passos técnicos do agente</h3>
+          <p>${steps}</p>
+          <p class="field-hint">Fontes citadas: ${sources}. O registro completo das fontes está no JSON desta análise.</p>
+        </div>
       </details>
     </div>`;
 }
@@ -459,21 +540,21 @@ function renderReview() {
   $('#review-content').innerHTML = `
     <div class="meta">${tag(date(run.created_at))} ${tag('Versão ' + run.id.slice(0, 8))} ${tag('Arquivo ' + run.dataset.fingerprint.slice(0, 12))}</div>
     ${renderProgress(run)}
-    <div class="notice"><strong>Os percentuais são hipóteses do grupo</strong>
-      <p>Partem do que o cliente disse na entrevista de 15/10/2026, mas não foram confirmados por ele. Por isso o resultado aparece em três cenários. Aprovar registra o aceite do estudo; não autoriza uma medida administrativa.</p></div>
-    ${run.roles_complete ? '' : `<div class="notice warning"><strong>Papéis da equipe pendentes nesta versão</strong>
-      <p>Registre os responsáveis reais em Equipe e entrevista antes de preparar a entrega. Esta análise preserva o cadastro da data em que foi gerada.</p>
+    <div class="notice compact"><strong>Os percentuais são hipóteses do grupo.</strong>
+      <span>Não foram confirmados pelo cliente. Aprovar registra o aceite do estudo; não autoriza a medida.</span></div>
+    ${run.roles_complete ? '' : `<div class="notice compact warning"><strong>Papéis da equipe pendentes nesta versão.</strong>
+      <span>Preencha antes de preparar a entrega; esta análise guarda o cadastro da data em que foi gerada.</span>
       <button type="button" class="button ghost" data-goto="project">Preencher equipe</button></div>`}
     ${renderAnalysisCard(run)}
-    <div class="tile">
+    <h2 class="proposals-title">Propostas para decidir</h2>
+    ${run.analysis.priorities.map(p => renderActionCard(run, p, actionsById)).join('')}
+    <div class="tile approved">
       <div class="tile-header"><div><h3>Resultado se só as propostas aprovadas valerem</h3>
         <p>${approved.approved_count} de ${approved.total_count} aprovadas para estudo · já desconta os custos · valor simulado</p></div>
         <div class="tile-value ${approved.projected_balance < 0 ? 'negative-text' : ''}">${brl(approved.projected_balance)}</div></div>
       ${approved.horizon ? `<p class="field-hint">Em ${approved.horizon.length} anos, o saldo acumulado com as propostas aprovadas seria ${brl(approved.horizon[approved.horizon.length - 1].cumulative_balance)} (valores constantes).</p>` : ''}
       ${approved.objective ? `<p><strong>${approved.objective.meets ? 'As propostas aprovadas cobrem a meta nos dez anos, nas contas da simulação.' : `As propostas aprovadas ainda deixam déficit no ano ${approved.objective.first_deficit_year}.`}</strong> O menor saldo anual seria ${brl(approved.objective.minimum_balance)}.</p>` : ''}
     </div>
-    <h2 class="more-title">Propostas para decidir</h2>
-    ${run.analysis.priorities.map(p => renderActionCard(run, p, actionsById)).join('')}
     ${renderAudit(run)}`;
   $$('#review-content [data-width]').forEach(el => el.style.setProperty('--w', el.dataset.width + '%'));
   annotate($('#review-content'));
@@ -661,6 +742,7 @@ async function init() {
     scenario = state.scenario;
     currentRun = state.latest;
     for (const [key, value] of Object.entries(state.defaults)) $('#' + key).value = value;
+    renderLeverBases();
     updateOutputs();
     renderMetrics();
     renderSituation();

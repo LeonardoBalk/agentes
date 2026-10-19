@@ -4,15 +4,18 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Estudo de caso de gestão municipal: situação atual, simulação de medidas e revisão humana.">
-  <title>Municipal Lab</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%230f62fe'/%3E%3Cpath d='M6 12 16 7l10 5M8 14v8m5-8v8m6-8v8m5-8v8M5 25h22' fill='none' stroke='white' stroke-width='2'/%3E%3C/svg%3E">
+  <title>LeopoldinAI | Gestão municipal</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="stylesheet" href="/style.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <header class="shell-header">
-    <span class="name">Municipal <span>Lab</span></span>
-    <span class="context">Prefeitura de Santa Leopoldina · estudo de caso acadêmico</span>
+    <a class="brand" href="#data" aria-label="LeopoldinAI: situação atual">
+      <svg class="brand-logo" viewBox="340 323 1105 217" width="164" height="32" aria-hidden="true">
+        <image href="/logo.png" width="1774" height="887" />
+      </svg>
+    </a>
     <span class="spacer"></span>
     <span class="tag" id="mode-tag">Modo demonstração</span>
   </header>
@@ -28,7 +31,7 @@
     <div id="load-error" class="notice danger" hidden></div>
 
     <section id="stepper-box" aria-label="Como usar">
-      <p class="eyebrow">COMO USAR · SIGA OS 3 PASSOS NA ORDEM</p>
+      <p class="eyebrow" id="step-count">Passo 1 de 3</p>
       <ol class="stepper" id="stepper">
         <li><button data-page="data"><span class="n">1</span><span><strong>Entender a situação</strong><small>Veja os números da prefeitura</small></span></button></li>
         <li><button data-page="simulation"><span class="n">2</span><span><strong>Simular medidas</strong><small>Ajuste as hipóteses e veja o efeito</small></span></button></li>
@@ -40,10 +43,11 @@
       <h1 class="page-title">Situação atual da prefeitura</h1>
       <p class="page-lead">Os números das receitas, despesas, dívida e folha de pagamento, lidos da planilha do estudo de caso. Não é preciso preencher nada nesta tela: basta ler e seguir para o passo 2.</p>
 
-      <div id="metrics" class="grid cols-4 section"></div>
+      <div id="summary" class="summary"></div>
+      <div id="metrics" class="grid cols-4 metrics-compact"></div>
 
       <div class="section">
-        <div class="section-head"><h2>O que chama atenção</h2><span id="situation-count" class="tag"></span></div>
+        <div class="section-head"><h2>Os pontos em detalhe</h2><span id="situation-count" class="tag"></span></div>
         <p class="field-hint">Cada cartão mostra um ponto calculado com os números da planilha. Os vermelhos pedem atenção primeiro.</p>
         <div id="situation" class="grid cols-3"></div>
       </div>
@@ -120,86 +124,113 @@
       <p class="page-lead">Compare o plano-base com a meta de equilíbrio em cada um dos dez anos. Ajuste as hipóteses ou carregue a alternativa calculada para estudar. Os valores dependem das premissas e da validação das medidas.</p>
       <div class="grid cols-2">
         <form id="scenario-form" class="tile">
-          <div class="section-head"><h2>Hipóteses principais</h2><button type="button" id="reset-inputs" class="button ghost">Voltar ao padrão</button></div>
+          <div class="section-head"><h2>Suas hipóteses</h2><button type="button" id="reset-inputs" class="button ghost">Voltar ao padrão</button></div>
+          <p class="field-hint">Cada bloco abaixo é uma das cinco propostas. Mexa nos controles e veja, no fim de cada bloco, quanto aquela medida rende. O resultado de tudo junto aparece ao lado.</p>
 
-          <div class="field">
-            <label for="recovery_pct">Dívida ativa: quanto será recuperado <output id="out-recovery_pct"></output></label>
-            <input id="recovery_pct" name="recovery_pct" type="range" min="0" max="100" step="1" value="0">
-            <p class="field-hint">Parte da dívida que a própria planilha estima como recuperável e que seria cobrada neste ano. Não é percentual sobre os R$ 100 milhões inteiros.</p>
-          </div>
+          <fieldset class="lever">
+            <legend><span class="n">1</span>Cobrar a dívida ativa</legend>
+            <p class="lever-what"><strong>O que faz:</strong> cobra de quem deve impostos atrasados. É dinheiro que entra <strong>uma vez só</strong>.</p>
+            <div class="field">
+              <label for="recovery_pct">Quanto da dívida recuperável será cobrado neste ano <output id="out-recovery_pct"></output></label>
+              <input id="recovery_pct" name="recovery_pct" type="range" min="0" max="100" step="1" value="0">
+              <p class="field-hint">É um percentual dos R$ 36,2 milhões que a própria planilha considera recuperáveis, não dos R$ 100 milhões inteiros. Muitos devedores não são encontrados, então valores altos são pouco realistas.</p>
+            </div>
+            <p class="lever-effect" data-effect="recuperar_divida"></p>
+          </fieldset>
 
-          <div class="field">
-            <label for="das_cut_pct">Cargos de confiança: redução dos gastos <output id="out-das_cut_pct"></output></label>
-            <input id="das_cut_pct" name="das_cut_pct" type="range" min="0" max="100" step="1" value="0">
-            <p class="field-hint">Percentual sobre os gastos, não sobre a quantidade de cargos. Hoje são 181 cargos; é preciso definir quais podem sair sem prejudicar a prefeitura.</p>
-          </div>
+          <fieldset class="lever">
+            <legend><span class="n">2</span>Revisar contratos de funcionamento</legend>
+            <p class="lever-what"><strong>O que faz:</strong> renegocia contratos e serviços de três secretarias, sem mexer em salários nem em obras. A economia se repete <strong>todo ano</strong>.</p>
+            <div class="field">
+              <label for="admin_pct">Administração <span class="lever-base" data-base="SEC-ADM"></span> <output id="out-admin_pct"></output></label>
+              <input id="admin_pct" name="admin_pct" type="range" min="0" max="30" step="0.5" value="0">
+            </div>
+            <div class="field">
+              <label for="environment_pct">Meio Ambiente <span class="lever-base" data-base="SEC-AMB"></span> <output id="out-environment_pct"></output></label>
+              <input id="environment_pct" name="environment_pct" type="range" min="0" max="30" step="0.5" value="0">
+            </div>
+            <div class="field">
+              <label for="security_pct">Segurança <span class="lever-base" data-base="SEC-SEG"></span> <output id="out-security_pct"></output></label>
+              <input id="security_pct" name="security_pct" type="range" min="0" max="30" step="0.5" value="0">
+              <p class="field-hint">O valor ao lado de cada nome é o gasto de funcionamento da secretaria (despesa menos folha e investimentos), que é sobre o que o percentual vale. Meio Ambiente tem a maior base; Segurança gasta quase tudo com a folha dos guardas.</p>
+            </div>
+            <p class="lever-effect" data-effect="revisar_custeio"></p>
+          </fieldset>
 
-          <div class="field">
-            <label for="refis_adhesion_pct">Refis do IPTU: quantos devedores aderem <output id="out-refis_adhesion_pct"></output></label>
-            <input id="refis_adhesion_pct" name="refis_adhesion_pct" type="range" min="0" max="100" step="1" value="0">
-            <p class="field-hint">O Refis dá desconto no valor devido por quem adere e deve IPTU. Não muda a alíquota do imposto.</p>
-          </div>
+          <fieldset class="lever">
+            <legend><span class="n">3</span>Cortar cargos de confiança</legend>
+            <p class="lever-what"><strong>O que faz:</strong> reduz o gasto com os 181 cargos comissionados, que custam cerca de R$ 20,2 milhões por ano. Concursados não são afetados. A economia se repete <strong>todo ano</strong>.</p>
+            <div class="field">
+              <label for="das_cut_pct">Redução do gasto com cargos de confiança <output id="out-das_cut_pct"></output></label>
+              <input id="das_cut_pct" name="das_cut_pct" type="range" min="0" max="100" step="1" value="0">
+              <p class="field-hint">É um percentual do gasto, não da quantidade de cargos. Quais cargos saem é decisão de RH, sem prejudicar o funcionamento da prefeitura.</p>
+            </div>
+            <p class="lever-effect" data-effect="reduzir_folha"></p>
+          </fieldset>
+
+          <fieldset class="lever">
+            <legend><span class="n">4</span>Refis do IPTU</legend>
+            <p class="lever-what"><strong>O que faz:</strong> dá desconto para quem deve IPTU quitar a dívida. Não muda o imposto. Entra <strong>uma vez só</strong> e, por mexer em tributação, exige aprovação em nível superior.</p>
+            <div class="field">
+              <label for="refis_adhesion_pct">Quantos devedores aderem <output id="out-refis_adhesion_pct"></output></label>
+              <input id="refis_adhesion_pct" name="refis_adhesion_pct" type="range" min="0" max="100" step="1" value="0">
+              <p class="field-hint">Vale só para a parte da dívida de IPTU que a planilha não considera recuperável (R$ 33,6 milhões).</p>
+            </div>
+            <div class="field">
+              <label for="refis_discount_pct">Desconto para quem aderir <output id="out-refis_discount_pct"></output></label>
+              <input id="refis_discount_pct" name="refis_discount_pct" type="range" min="0" max="50" step="1" value="0">
+              <p class="field-hint">Quanto maior o desconto, menos entra de cada devedor. A planilha não separa juros e multa, então o desconto vale para o valor total. O teto de 50% é escolha do grupo.</p>
+            </div>
+            <p class="lever-effect" data-effect="refis_iptu"></p>
+          </fieldset>
+
+          <fieldset class="lever">
+            <legend><span class="n">5</span>Ordem de prioridade para os pagamentos</legend>
+            <p class="lever-what"><strong>O que faz:</strong> troca o "quem pede primeiro, recebe primeiro" por prioridades definidas. É uma regra de gestão: não tem controle aqui e não entra nas contas.</p>
+          </fieldset>
 
           <details class="accordion advanced">
-            <summary>Ajustes avançados <span class="tag">gastos de funcionamento, contratos temporários, desconto do Refis e custos</span></summary>
+            <summary>
+              <span class="advanced-title">Opções avançadas <small>clique para abrir</small></span>
+              <span class="advanced-summary" id="advanced-summary"></span>
+            </summary>
             <div class="body">
-              <h3>Gastos de funcionamento: economia por secretaria</h3>
+              <h3>Custos para colocar cada medida em prática (R$)</h3>
+              <p class="field-hint">Entram uma vez, no ano 1. Não há dado na planilha para estimá-los melhor, então os valores padrão são hipóteses.</p>
               <div class="field">
-                <label for="admin_pct">Administração <output id="out-admin_pct"></output></label>
-                <input id="admin_pct" name="admin_pct" type="range" min="0" max="30" step="0.5" value="0">
-              </div>
-              <div class="field">
-                <label for="environment_pct">Meio Ambiente <output id="out-environment_pct"></output></label>
-                <input id="environment_pct" name="environment_pct" type="range" min="0" max="30" step="0.5" value="0">
-              </div>
-              <div class="field">
-                <label for="security_pct">Segurança <output id="out-security_pct"></output></label>
-                <input id="security_pct" name="security_pct" type="range" min="0" max="30" step="0.5" value="0">
-                <p class="field-hint">A base é a despesa menos folha e investimentos. Depende de conferir os contratos e preservar os serviços essenciais.</p>
-              </div>
-
-              <h3>Reposição por contrato temporário (opcional, não validada)</h3>
-              <div class="notice warning"><p>Começa em 0% e não entra no cenário padrão. O STF (Tema 612) exige necessidade temporária e interesse público excepcional e não admite temporário para serviço permanente. Ligue só para testar e confirme o enquadramento com a Procuradoria.</p></div>
-              <div class="field">
-                <label for="attrition_pct">Servidores que saem por ano <output id="out-attrition_pct"></output></label>
-                <input id="attrition_pct" name="attrition_pct" type="range" min="0" max="20" step="0.5" value="0">
-                <p class="field-hint">Concursados não são demitidos: só a saída natural (aposentadoria, pedido de saída) é reposta.</p>
-              </div>
-              <div class="field">
-                <label for="temp_saving_pct">Economia ao contratar temporário no lugar <output id="out-temp_saving_pct"></output></label>
-                <input id="temp_saving_pct" name="temp_saving_pct" type="range" min="0" max="60" step="1" value="0">
-                <p class="field-hint">O efeito cresce ao longo dos anos, conforme mais vagas são repostas.</p>
-              </div>
-
-              <h3>Desconto do Refis</h3>
-              <div class="field">
-                <label for="refis_discount_pct">Desconto sobre a dívida de quem adere <output id="out-refis_discount_pct"></output></label>
-                <input id="refis_discount_pct" name="refis_discount_pct" type="range" min="0" max="50" step="1" value="0">
-                <p class="field-hint">A planilha não separa juros e multa, então o desconto vale para o valor total devido. O teto de 50% é escolha do grupo (o cliente só pediu cuidado); exige aprovação em nível superior.</p>
-              </div>
-
-              <h3>Custos para colocar em prática (R$)</h3>
-              <div class="field">
-                <label for="collection_cost">Cobrança e recuperação da dívida</label>
+                <label for="collection_cost">Cobrança da dívida ativa</label>
                 <input id="collection_cost" name="collection_cost" type="number" min="0" max="1000000000" step="1000" value="500000" required>
               </div>
               <div class="field">
-                <label for="savings_cost">Revisão dos contratos de funcionamento</label>
+                <label for="savings_cost">Revisão dos contratos</label>
                 <input id="savings_cost" name="savings_cost" type="number" min="0" max="1000000000" step="1000" value="100000" required>
               </div>
               <div class="field">
-                <label for="das_cost">Transição de pessoal (verbas proporcionais)</label>
+                <label for="das_cost">Saída dos cargos de confiança (verbas proporcionais)</label>
                 <input id="das_cost" name="das_cost" type="number" min="0" max="1000000000" step="1000" value="300000" required>
               </div>
               <div class="field">
                 <label for="refis_cost">Programa de Refis</label>
                 <input id="refis_cost" name="refis_cost" type="number" min="0" max="1000000000" step="1000" value="200000" required>
               </div>
+
+              <h3>Reposição por contrato temporário (opcional, não validada)</h3>
+              <div class="notice warning"><p>Começa desligada (0%) e não entra no cenário padrão. O STF (Tema 612) só admite temporário para necessidade temporária e excepcional, nunca para serviço permanente. Ligue só para testar.</p></div>
+              <div class="field">
+                <label for="attrition_pct">Servidores administrativos que saem por ano <output id="out-attrition_pct"></output></label>
+                <input id="attrition_pct" name="attrition_pct" type="range" min="0" max="20" step="0.5" value="0">
+                <p class="field-hint">Concursados não são demitidos: só quem sai naturalmente (aposentadoria, pedido) seria reposto.</p>
+              </div>
+              <div class="field">
+                <label for="temp_saving_pct">Economia ao contratar temporário no lugar <output id="out-temp_saving_pct"></output></label>
+                <input id="temp_saving_pct" name="temp_saving_pct" type="range" min="0" max="60" step="1" value="0">
+              </div>
             </div>
           </details>
         </form>
 
         <div>
+          <div id="sim-sticky" class="sim-sticky" aria-live="polite"></div>
           <div id="scenario-results"></div>
           <div class="tile">
             <h2>Pronto? Gere a análise</h2>
