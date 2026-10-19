@@ -101,7 +101,7 @@ class Application:
 
 def make_handler(app: Application):
     class Handler(BaseHTTPRequestHandler):
-        server_version='MunicipalLab/1.0'
+        server_version='LeopoldinAI/1.0'
 
         def send(self,data,status=200,content_type='application/json; charset=utf-8',filename=None):
             raw=data if isinstance(data,bytes) else json.dumps(data,ensure_ascii=False,allow_nan=False).encode('utf-8')
@@ -125,10 +125,16 @@ def make_handler(app: Application):
                 return self.send(dict(error='Host não autorizado.'),403)
             path=urlparse(self.path).path
             try:
-                assets={'/':('index.html','text/html; charset=utf-8'),'/app.js':('app.js','text/javascript; charset=utf-8'),'/style.css':('style.css','text/css; charset=utf-8')}
+                assets={
+                    '/':(app.root/'web'/'index.html','text/html; charset=utf-8'),
+                    '/app.js':(app.root/'web'/'app.js','text/javascript; charset=utf-8'),
+                    '/style.css':(app.root/'web'/'style.css','text/css; charset=utf-8'),
+                    '/logo.png':(app.root/'assets'/'branding'/'logo.png','image/png'),
+                    '/favicon.png':(app.root/'assets'/'branding'/'icon.png','image/png'),
+                }
                 if path in assets:
-                    name,mime=assets[path]
-                    return self.send((app.root/'web'/name).read_bytes(),content_type=mime)
+                    asset,mime=assets[path]
+                    return self.send(asset.read_bytes(),content_type=mime)
                 if path=='/api/state':
                     return self.send(app.state())
                 if path.startswith('/api/jobs/'):
@@ -205,7 +211,7 @@ def make_handler(app: Application):
 
 
 def main():
-    parser=argparse.ArgumentParser(description='Municipal Lab - app local do estudo de caso')
+    parser=argparse.ArgumentParser(description='LeopoldinAI - app local do estudo de caso')
     parser.add_argument('--port',type=int,default=8765)
     parser.add_argument('--open',action='store_true')
     args=parser.parse_args()
@@ -217,7 +223,7 @@ def main():
         print(f'Não foi possível iniciar: {e}')
         raise SystemExit(1)
     url=f'http://127.0.0.1:{args.port}'
-    print(f'Municipal Lab: {url}\nModo demonstração disponível. Ctrl+C encerra o servidor.',flush=True)
+    print(f'LeopoldinAI: {url}\nModo demonstração disponível. Ctrl+C encerra o servidor.',flush=True)
     if args.open:
         webbrowser.open(url)
     try:
