@@ -1,4 +1,6 @@
-# Municipal Lab
+# LeopoldinAI
+
+A identidade aprovada está em `assets/branding/logo.png` (símbolo à esquerda e nome) e `assets/branding/icon.png` (símbolo isolado). O cabeçalho usa fundo branco para preservar a marca azul; o ícone também aparece na aba do navegador.
 
 Protótipo de apoio à decisão para o estudo de caso da **Prefeitura de Santa Leopoldina** (trabalho final, UFSM). O app lê a planilha de receitas, despesas, dívida ativa e folha, simula cinco medidas para reduzir o déficit e entrega as propostas a uma pessoa, que aprova, recusa ou pede revisão.
 
@@ -31,14 +33,23 @@ Copy-Item .env.example .env
 
 Abra o `.env` e preencha `LLM_API_KEY` com uma chave do [Google AI Studio](https://aistudio.google.com/apikey). O modelo padrão é `gemini/gemini-3.5-flash`. Reinicie o servidor; o selo do canto superior passa a mostrar "Agente de IA ligado".
 
-O `.env` está no `.gitignore` e nunca vai para o `.zip`. Não coloque a chave em nenhum outro arquivo.
+### Modelos reserva
+
+Se o modelo principal falhar, o app tenta os modelos reserva configurados no `.env`, nesta ordem:
+
+1. **`LLM_RESERVA_MODEL`**: outro modelo Gemini com a mesma chave. O padrão sugerido é `gemini/gemini-3.5-flash-lite`, que tem cota própria e responde em menos de 30 segundos.
+2. **`GROQ_API_KEY`** (e `GROQ_MODEL`, padrão `openai/gpt-oss-120b`): chave gratuita do [Groq](https://console.groq.com). O plano gratuito aceita só 8.000 tokens por minuto, então esse modelo recebe uma **versão resumida dos dados**. O app conduz as chamadas e as espaça para caber no limite, e a análise leva cerca de 2 minutos.
+
+As regras de validação valem para todos os modelos. Quando uma análise vem de um modelo reserva, a tela de Revisão mostra qual modelo falhou, por quê, e quem respondeu. Sem essas variáveis, não há reserva.
+
+O `.env` está no `.gitignore` e nunca vai para o `.zip`. Não coloque as chaves em nenhum outro arquivo.
 
 ## Como usar
 
 O app tem quatro telas. As três primeiras seguem a ordem do raciocínio, indicada no topo de cada uma.
 
 1. **Situação atual.** Totais, sete alertas calculados com a planilha (resultado, arrecadação, despesa acima da dotação, folha, dívida ativa, convênios e restos a pagar) e a divisão da despesa por secretaria. Tabelas, limitações, fontes, funcionamento interno e glossário ficam recolhidos em "Quer ver mais detalhes?".
-2. **Simulação.** Três hipóteses principais (dívida, cargos de confiança e Refis) e os demais ajustes em "Ajustes avançados". A tela mostra o resultado em 12 meses, a projeção de 10 anos, quanto do déficit recorrente o plano cobre, três cenários (conservador, base e otimista) e, se o plano não fechar, uma **alternativa de equilíbrio para estudar**. No fim, "Gerar análise" salva a versão e chama o agente.
+2. **Simulação.** Um bloco por proposta, cada um com o que a medida faz, seus controles e quanto ela rende com os valores escolhidos. Custos de implantação e a reposição opcional por temporários ficam em "Opções avançadas", com um resumo visível mesmo fechado. A tela mostra o resultado em 12 meses, a projeção de 10 anos, quanto do déficit recorrente o plano cobre, três cenários (conservador, base e otimista) e, se o plano não fechar, uma **alternativa de equilíbrio para estudar**. No fim, "Gerar análise" salva a versão e chama o agente.
 3. **Revisão e decisão.** Cada proposta abre ao clicar. Quem revisa informa nome, decisão e justificativa; o Refis exige também o nome de um aprovador em nível superior. A barra do topo mostra quantas propostas já têm decisão. O resultado pode ser baixado em JSON ou CSV.
 4. **Equipe e entrevista.** Papéis do grupo e as respostas da entrevista com o cliente, que o agente recebe.
 
@@ -63,7 +74,7 @@ flowchart LR
 - **O agente** usa três ferramentas: `consultar_indicadores` (planilha, alertas e entrevista), `consultar_simulacao` (propostas, projeção, cenários, meta e alternativa) e `consultar_fontes_oficiais`. Elas correspondem aos papéis do roteiro de entrevista: o agente financeiro e o operacional viram as duas primeiras ferramentas, o de coleta externa vira a terceira, e o revisor é a pessoa.
 - **O código valida a resposta**: rejeita propostas desconhecidas ou repetidas, fontes não consultadas e respostas que não usaram as três ferramentas. Isso não garante que todo o texto esteja certo; a pessoa precisa ler.
 - **Fontes externas**: o app recupera artigos específicos nos sites oficiais. São os arts. 14, 19, 20, 22 e 42 da LRF e os arts. 58, 62, 63 e 64 da Lei 4.320/1964, e esses trechos vão ao agente como contexto. É uma **recuperação fixa de artigos oficiais como contexto**, sem busca semântica nem banco vetorial. Do Manual de Demonstrativos Fiscais (Tesouro) só a página de apresentação é lida.
-- **Erros do provedor**: se o Gemini responder 503 (alta demanda), 429 (limite de uso) ou demorar demais, o app tenta de novo até três vezes. Erros permanentes, como chave recusada ou modelo indisponível, aparecem com uma mensagem clara e nada é salvo como sucesso.
+- **Erros do provedor**: em 503 (alta demanda), limite por minuto ou demora, o app tenta o mesmo modelo de novo até três vezes. Se a cota do dia acabou (429 com espera longa), ele não insiste e passa direto para o próximo modelo da lista de reservas. Erros permanentes, como chave recusada ou modelo indisponível, aparecem com uma mensagem clara e nada é salvo como sucesso.
 
 ## As cinco propostas
 
@@ -117,9 +128,9 @@ Todos os valores são constantes, sem inflação nem crescimento, e condicionado
   - contas a pagar por faixa, para avaliar a ordem de pagamentos.
 - **Uso local apenas.** O app é um protótipo para uma máquina: não tem autenticação nem trilha inviolável. Não exponha em rede pública.
 
-### O que vai para o Google
+### O que vai para os provedores de IA
 
-As chamadas de IA enviam indicadores agregados, premissas, limitações, respostas da entrevista e trechos das leis. A lista individual de servidores e os nomes da equipe não são enviados.
+As chamadas de IA (Google e, se a reserva for usada, Groq) enviam indicadores agregados, premissas, limitações, respostas da entrevista e trechos das leis. A lista individual de servidores e os nomes da equipe não são enviados.
 
 ## Estrutura
 
@@ -128,7 +139,7 @@ main.py                 Servidor HTTP local (biblioteca padrão) e rotas da API
 municipal/
   dados.py              Leitura da planilha, indicadores e diagnóstico da situação atual
   simulacao.py          As 5 propostas, projeção de 10 anos, cenários, meta e alternativa de equilíbrio
-  agente.py             Um agente CrewAI, três ferramentas, validação da resposta e novas tentativas
+  agente.py             Um agente CrewAI, três ferramentas, validação da resposta, novas tentativas e modelos reserva
   fontes.py             Recuperação dos artigos oficiais (LRF e Lei 4.320) e da página do MDF
   storage.py            Versões das análises, decisões e entrevista em SQLite
 web/
@@ -148,14 +159,16 @@ runtime/                Banco, cache das fontes e logs (local, fora do .zip)
 node --check web/app.js
 ```
 
-São 35 testes. Eles cobrem os totais da planilha, as cinco propostas, a projeção de 10 anos, os cenários, a meta e a alternativa de equilíbrio, o teto do Refis, a aprovação superior, a recuperação de artigos, as novas tentativas em erro do provedor, a API e a exportação. O teste de integração usa o **CrewAI de verdade contra um LLM local simulado**, sem chave nem custo; ele confirma o fluxo de ferramentas, não a qualidade de um modelo real.
+São 41 testes. Eles cobrem os totais da planilha, as cinco propostas, a projeção de 10 anos, os cenários, a meta e a alternativa de equilíbrio, o teto do Refis, a aprovação superior, a recuperação de artigos, as novas tentativas em erro do provedor, a cadeia de modelos reserva (inclusive a cota diária esgotada), o caminho do Groq, a API e a exportação. O teste de integração usa o **CrewAI de verdade contra um LLM local simulado**, sem chave nem custo; ele confirma o fluxo de ferramentas, não a qualidade de um modelo real.
 
-### Modelos Gemini testados (17/10/2026)
+### Modelos testados (17 a 19/10/2026)
 
 | Modelo | Resultado |
 |---|---|
 | `gemini-3.5-flash` | Quando responde, conclui em 36 a 80 segundos usando as três ferramentas. É o padrão. Em alguns horários o Google devolve 503 (alta demanda) mesmo depois das três tentativas; espere alguns minutos e gere de novo. |
-| `gemini-3.1-flash-lite` | Rápido, mas devolveu propostas erradas, e a validação descartou a resposta. |
+| `gemini-3.5-flash-lite` | Passou em 4 de 4 execuções, em 13 a 25 segundos, com as três ferramentas e as cinco propostas certas. É a primeira reserva. |
+| Groq `openai/gpt-oss-120b` (dados resumidos) | Passou em 4 de 4 execuções, em cerca de 130 segundos. É a segunda reserva. Pelo conector padrão do CrewAI o Groq não funciona: recusa o formato e estoura o limite por minuto. |
+| `gemini-3.1-flash-lite` | Não consultou nenhuma ferramenta e inventou propostas e fontes (`PROP_001`, `FONTE_OFICIAL_01`). A validação descartou as 4 respostas. |
 | `gemini-flash-latest` | Levou 146 segundos e errou as propostas. O atalho muda sem aviso. |
 | `gemini-2.5-flash`, `2.5-flash-lite`, `2.5-pro` | Aparecem na lista, mas recusam contas novas. |
 

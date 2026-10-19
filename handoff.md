@@ -1,4 +1,4 @@
-# Handoff do projeto
+# Handoff do LeopoldinAI
 
 Estado em **19/10/2026**. Nossa entrega final é **04/11/2026, às 23h55**: depois disso, relatório e apresentação ficam bloqueados.
 
@@ -29,7 +29,7 @@ Deixei a parte de software pronta e testada. **O trabalho ainda não está pront
 3. **Decidir o que o relatório diz sobre o déficit.** O plano-base não resolve. A alternativa de 32% resolve nas contas, mas só se as hipóteses se confirmarem. Precisamos escolher se recomendamos a alternativa, outra combinação ou se só registramos o limite.
 4. **Escrever o relatório** conforme o MDT UFSM. O enunciado **proíbe usar IA para escrevê-lo**. Este handoff e o README servem de consulta, não de texto para copiar. As seções obrigatórias estão na página 2 do enunciado.
 5. **Montar a apresentação**: equipe e papéis, diagnóstico (entrevista e planilha) e o plano com os resultados.
-6. **Trocar a chave do Gemini.** A chave que está no `.env` acabou exposta, então vou gerar outra no Google AI Studio, apagar a antiga e atualizar o `.env`.
+6. **Trocar as chaves.** As chaves do Gemini e do Groq que estão no `.env` acabaram expostas, então vou gerar outras (Google AI Studio e console.groq.com), apagar as antigas e atualizar o `.env`.
 
 ## Análises salvas no app
 
@@ -39,8 +39,9 @@ Ficam em `runtime/municipal.sqlite3` e aparecem no seletor da tela de Revisão.
 |---|---|---|---|
 | `529004d0`, `754be8bb`, `dd63d7a2` | 16 e 17/10 | Demonstração | Versões antigas, de quando o app tinha 2 propostas. Uma tem uma decisão de teste. Podem ignorar. |
 | `c8ea0a14` | 18/10 | Agente de IA (Gemini) | Plano-base com as 5 propostas, sem decisões. É anterior à meta de equilíbrio. |
+| `9f1f014f` | 19/10 | Agente de IA (Gemini) | Gerada com as três hipóteses principais em 100% (cortar todos os cargos de confiança, todos pagarem). Os valores são irreais. **Não usem.** |
 
-Em 19/10 tentei duas vezes gerar a análise da alternativa de 32% (às 11h50 e uns 5 minutos depois). Nas duas o Google respondeu com erro 503, de alta demanda, mesmo com as três novas tentativas automáticas do app. Nada foi salvo, então é preciso gerar de novo pela tela em outro horário.
+Em 19/10 tentei duas vezes gerar a análise da alternativa de 32%, e nas duas o Google respondeu com erro 503 (alta demanda). Depois descobri outro limite: o plano gratuito do Gemini Flash aceita só cerca de **20 requisições por dia**, umas 3 a 5 análises, e a cota acabou. Por isso coloquei **modelos reserva**: se o principal falhar, o app tenta o Gemini Flash-Lite e depois o Groq (ver a tabela de decisões). Ainda falta gerar a análise da alternativa pela tela.
 
 ## Números para o relatório e a apresentação
 
@@ -66,7 +67,8 @@ Saem da planilha e das hipóteses padrão, e dá para conferir todos na tela.
 |---|---|
 | Agente único com validação humana, não multiagente | O enunciado aceita os dois. Como os números já saem do Python, vários agentes só reescreveriam o mesmo texto, com mais falhas e mais tempo. As três ferramentas cobrem os papéis do roteiro (financeiro, operacional e coleta externa), e o revisor é a pessoa. |
 | O Python calcula; a IA só ordena e explica | Os números ficam reproduzíveis e testáveis. A IA não inventa valores nem propostas, e o código rejeita respostas fora das regras. |
-| Gemini `gemini-3.5-flash` | Foi o único modelo que testei que concluiu as execuções e acertou as propostas. A família 2.5 recusa contas novas. Tirei a DeepSeek do projeto. |
+| Gemini `gemini-3.5-flash` como principal | É o modelo que melhor seguiu as regras com os dados completos. A família 2.5 recusa contas novas. Tirei a DeepSeek do projeto. |
+| Reservas: Gemini `3.5-flash-lite` e Groq `gpt-oss-120b` | A cota gratuita do Flash acaba rápido e o Google às vezes fica sobrecarregado. O Flash-Lite passou em 4 de 4 testes, usa a mesma chave e tem cota própria. O Groq também passou em 4 de 4, mas no plano gratuito só aceita 8.000 tokens por minuto, então recebe dados resumidos e leva uns 2 minutos. O `3.1-flash-lite` foi descartado: inventou propostas e fontes sem consultar as ferramentas. |
 | Temporários desligados por padrão | O cliente citou isso como possibilidade ("talvez"), e o STF (Tema 612) restringe contratação temporária. Deixei a opção só para teste. |
 | Desconto do Refis sobre o valor total devido | A planilha não separa principal, juros e multa. O teto de 50% foi escolha minha, não do cliente. |
 | Desconto do Refis fixo entre cenários | Se aumentasse a renúncia no cenário otimista, a receita cairia e ele ficaria pior que o base. |
@@ -79,7 +81,7 @@ Saem da planilha e das hipóteses padrão, e dá para conferir todos na tela.
 
 - **Servidor antigo preso na porta.** Se a tela mostrar dados velhos ou erro ao carregar, pode haver um servidor de outra sessão ainda ligado. Fechem os terminais do app (ou encerrem os processos `python.exe` que rodam `main.py`) e abram o `iniciar.bat` de novo.
 - **Reiniciar depois de mudar o `.env` ou o código.** O servidor só lê os dois ao iniciar.
-- **Erro 503 do Gemini.** É sobrecarga do Google. O app já tenta três vezes; se falhar, esperem alguns minutos.
+- **Erros do Gemini (503 ou cota esgotada).** O app tenta de novo e, se não der, passa para as reservas. Quando isso acontece, a tela de Revisão avisa qual modelo respondeu. Se todos falharem, esperem alguns minutos (ou o dia seguinte, se for cota).
 - **A ordem das propostas muda entre execuções.** É normal para um modelo de linguagem, e a decisão é sempre da pessoa.
 - **O repositório não leva o banco.** O GitHub (https://github.com/LeonardoBalk/agentes) tem o código e a planilha, mas não a pasta `runtime/`, com as respostas da entrevista, os papéis e as decisões. Quem clonar precisa copiar o meu `runtime/municipal.sqlite3` ou cadastrar a entrevista de novo a partir do PDF.
 - **O `.env` não vai junto.** Cada máquina precisa do seu `.env` com a chave. Peçam a nova quando eu trocar.
@@ -92,7 +94,7 @@ Saem da planilha e das hipóteses padrão, e dá para conferir todos na tela.
 node --check web/app.js
 ```
 
-O resultado esperado é **35 testes, OK**. Depois abram o app e confiram se o selo do canto mostra "Agente de IA ligado" e se a tela de Simulação mostra a alternativa de 32%.
+O resultado esperado é **41 testes, OK**. Depois abram o app e confiram se o selo do canto mostra "Agente de IA ligado" e se a tela de Simulação mostra a alternativa de 32%.
 
 ## Onde está cada coisa
 
