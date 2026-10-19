@@ -1,0 +1,2 @@
+-r requirements.txt
+crewai[litellm,google-genai]==1.15.28
