@@ -9,6 +9,8 @@ import math
 import re
 import threading
 import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode
@@ -54,6 +56,9 @@ def resultado(fonte_id: str, url: str | None, status: str, note: str, valores: d
                 checked_at=checked_at if checked_at is not None else (None if status == 'nao_consultada' else now()),
                 content_sha256=hashlib.sha256(conteudo).hexdigest() if conteudo is not None else None,
                 note=note, valores=valores or {})
+
+
+CHAVES_RESULTADO = {'id', 'title', 'url', 'status', 'checked_at', 'content_sha256', 'note', 'valores'}
 
 
 def nao_consultadas() -> list[dict]:
@@ -466,3 +471,146 @@ def buscar_siconfi(recurso: str, parametros: dict, esperar: Callable[[float], No
     itens += pagina['items']
     envelope = dict(items=itens, hasMore=False, limit=len(itens), offset=0, count=len(itens))
     return url, json.dumps(envelope, ensure_ascii=False).encode('utf-8')
+
+
+
+# ---------------------------------------------------------------- cache
+
+# o RGF é semestral e o publicado só muda por retificação: uma semana pega uma retificação sem
+# repetir a consulta a cada análise. A estimativa do IBGE sai uma vez por ano (a de 2025 foi
+# atualizada em 28/08/2026, segundo /agregados/6579/periodos); 30 dias basta.
+VALIDADE = dict(siconfi_rgf_pessoal=timedelta(days=7), ibge_populacao=timedelta(days=30),
+                ibge_populacao_municipios=timedelta(days=30))
+CHAVES_ENTRADA = {'url', 'ultimo_bom', 'ultimo_bom_em', 'ultima_tentativa', 'ultima_tentativa_em'}
+MUNICIPIO_PADRAO = 3204500   # Santa Leopoldina, confirmado na API de localidades do IBGE (ETAPA1_APIS.md)
+UF_PADRAO = 32               # Espírito Santo
+
+# uma coleta por vez no processo: o servidor é ThreadingHTTPServer, e duas análises simultâneas não
+# podem gravar o cache ao mesmo tempo nem disparar a mesma consulta duas vezes.
+TRAVA_COLETA = threading.Lock()
+
+
+def agora_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def instante(texto: Any) -> datetime:
+    momento = datetime.fromisoformat(texto) if isinstance(texto, str) else None
+    if momento is None or momento.tzinfo is None:
+        raise ValueError(f'Instante inválido no cache: {texto!r}.')
+    return momento
+
+
+def entrada_valida(fonte_id: str, entrada: Any) -> bool:
+    if not isinstance(entrada, dict) or set(entrada) != CHAVES_ENTRADA or not isinstance(entrada['url'], str):
+        return False
+    for chave in ('ultimo_bom', 'ultima_tentativa'):
+        r = entrada[chave]
+        if r is not None and (not isinstance(r, dict) or set(r) != CHAVES_RESULTADO
+                              or r['id'] != fonte_id or r['status'] not in STATUS):
+            return False
+    if entrada['ultima_tentativa'] is None or (entrada['ultimo_bom'] is None) != (entrada['ultimo_bom_em'] is None):
+        return False
+    if entrada['ultimo_bom'] is not None and entrada['ultimo_bom']['status'] != 'consultada':
+        return False
+    try:
+        for chave in ('ultimo_bom_em', 'ultima_tentativa_em'):
+            if entrada[chave] is not None:
+                instante(entrada[chave])
+    except ValueError:
+        return False
+    return True
+
+
+def ler_cache(cache: Path) -> dict:
+    """entradas do cache; arquivo ausente, corrompido ou com formato estranho vira cache vazio."""
+    try:
+        dados = json.loads(cache.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    # mesma ideia do source_status: qualquer id ou entrada fora do esperado invalida o arquivo todo.
+    if not isinstance(dados, dict) or not set(dados) <= {f['id'] for f in COLETAS}:
+        return {}
+    if not all(entrada_valida(fonte_id, entrada) for fonte_id, entrada in dados.items()):
+        return {}
+    return dados
+
+
+def gravar_cache(cache: Path, dados: dict) -> None:
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    temp = cache.with_suffix('.tmp')
+    temp.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding='utf-8')
+    temp.replace(cache)
+
+
+def coletar(cache: Path, fonte_id: str, url: str, obter: Callable[[str], dict],
+            agora: Callable[[], datetime] = agora_utc) -> dict:
+    """devolve o valor do cache se ainda vale; senão consulta com obter(checked_at) e grava."""
+    with TRAVA_COLETA:
+        dados = ler_cache(cache)
+        entrada = dados.get(fonte_id)
+        if entrada and entrada['url'] != url:
+            # outra consulta (outro exercício ou município): o valor guardado não responde a esta.
+            entrada = None
+        momento = agora()
+        bom = entrada['ultimo_bom'] if entrada else None
+        bom_em = entrada['ultimo_bom_em'] if entrada else None
+        if bom and timedelta(0) <= momento - instante(bom_em) < VALIDADE[fonte_id]:
+            return dict(bom)
+        novo = obter(momento.isoformat())
+        if novo['status'] == 'consultada':
+            bom, bom_em = novo, momento.isoformat()
+        dados[fonte_id] = dict(url=url, ultimo_bom=bom, ultimo_bom_em=bom_em,
+                               ultima_tentativa=novo, ultima_tentativa_em=momento.isoformat())
+        gravar_cache(cache, dados)
+        return novo
+
+
+def obter_por(fonte_id: str, url: str, baixar_bytes: Callable[[], bytes],
+              ler: Callable[[bytes, str], dict]) -> Callable[[str], dict]:
+    """liga a busca ao leitor; falha de rede vira indisponivel com a nota da tentativa."""
+    def obter(checked_at: str) -> dict:
+        try:
+            conteudo = baixar_bytes()
+        except FalhaColeta as e:
+            return resultado(fonte_id, url, 'indisponivel', str(e), checked_at=checked_at)
+        return ler(conteudo, checked_at)
+    return obter
+
+
+def coletar_rgf_pessoal(cache: Path, exercicio: int, periodo: int, id_ente: int = MUNICIPIO_PADRAO,
+                        periodicidade: str = 'S', demonstrativo: str = 'RGF Simplificado',
+                        esperar: Callable[[float], None] = time.sleep, relogio: Callable[[], float] = time.monotonic,
+                        agora: Callable[[], datetime] = agora_utc) -> dict:
+    """RGF-Anexo 01 do Executivo. Santa Leopoldina publica o simplificado semestral (ETAPA1_APIS.md)."""
+    parametros = dict(an_exercicio=exercicio, in_periodicidade=periodicidade, nr_periodo=periodo,
+                      co_tipo_demonstrativo=demonstrativo, no_anexo=ANEXO_PESSOAL, co_esfera='M',
+                      co_poder='E', id_ente=id_ente)
+    url = url_siconfi('rgf', parametros)
+    obter = obter_por('siconfi_rgf_pessoal', url,
+                      lambda: buscar_siconfi('rgf', parametros, esperar, relogio)[1],
+                      lambda conteudo, checked_at: ler_rgf_pessoal(conteudo, url, checked_at))
+    return coletar(cache, 'siconfi_rgf_pessoal', url, obter, agora)
+
+
+def url_populacao(ano: int, localidades: str) -> str:
+    return (f'https://servicodados.ibge.gov.br/api/v3/agregados/{AGREGADO_POPULACAO}/periodos/{ano}'
+            f'/variaveis/{VARIAVEL_POPULACAO}?localidades={quote(localidades, safe="")}')
+
+
+def coletar_populacao_municipio(cache: Path, ano: int, codigo_ibge: int = MUNICIPIO_PADRAO,
+                                esperar: Callable[[float], None] = time.sleep,
+                                agora: Callable[[], datetime] = agora_utc) -> dict:
+    url = url_populacao(ano, f'N6[{codigo_ibge}]')
+    obter = obter_por('ibge_populacao', url, lambda: buscar(url, esperar),
+                      lambda conteudo, checked_at: ler_populacao_municipio(conteudo, url, codigo_ibge, ano, checked_at))
+    return coletar(cache, 'ibge_populacao', url, obter, agora)
+
+
+def coletar_populacao_municipios(cache: Path, ano: int, uf: int = UF_PADRAO,
+                                 esperar: Callable[[float], None] = time.sleep,
+                                 agora: Callable[[], datetime] = agora_utc) -> dict:
+    url = url_populacao(ano, f'N6[N3[{uf}]]')
+    obter = obter_por('ibge_populacao_municipios', url, lambda: buscar(url, esperar),
+                      lambda conteudo, checked_at: ler_populacao_municipios(conteudo, url, ano, checked_at))
+    return coletar(cache, 'ibge_populacao_municipios', url, obter, agora)
