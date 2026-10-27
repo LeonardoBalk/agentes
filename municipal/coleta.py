@@ -11,6 +11,7 @@ import threading
 import time
 from typing import Any, Callable
 from urllib.error import HTTPError
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from municipal.dados import DataError
@@ -395,3 +396,73 @@ class Ritmo:
 
 
 RITMO_SICONFI = Ritmo(INTERVALO_SICONFI)
+
+
+
+# ---------------------------------------------------------------- paginação do siconfi
+
+SICONFI_BASE = 'https://apidatalake.tesouro.gov.br/ords/cdwhprd/siconfi/tt/'
+# o RGF inteiro de Santa Leopoldina tem 371 itens e cabe numa página de 5.000. Dez páginas são 50.000
+# itens, muito acima de qualquer demonstrativo de um ente; passar disso indica hasMore preso em true.
+TETO_PAGINAS = 10
+
+
+def url_siconfi(recurso: str, parametros: dict) -> str:
+    """sempre a partir da base pública; links[].href da resposta aponta para host interno da Oracle."""
+    return SICONFI_BASE + recurso + '?' + urlencode(parametros, quote_via=quote)
+
+
+def pagina_json(conteudo: bytes) -> Any:
+    """envelope da página, ou None quando o corpo não é JSON (o leitor recusa depois, com a nota certa)."""
+    try:
+        return json.loads(conteudo.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def tem_mais(pagina: Any) -> bool:
+    return isinstance(pagina, dict) and pagina.get('hasMore') is True and isinstance(pagina.get('items'), list)
+
+
+def inteiro_envelope(pagina: dict, nome: str, paginas: int) -> int:
+    valor = pagina.get(nome)
+    if isinstance(valor, bool) or not isinstance(valor, int) or valor < 0:
+        raise FalhaColeta(f'Paginação do SICONFI com {nome} inválido: {valor!r}.', paginas)
+    return valor
+
+
+def buscar_siconfi(recurso: str, parametros: dict, esperar: Callable[[float], None] = time.sleep,
+                   relogio: Callable[[], float] = time.monotonic) -> tuple[str, bytes]:
+    """url da primeira página e bytes de um envelope único com hasMore false.
+
+    Página única: os bytes originais, sem alteração. Várias páginas: os items somados num envelope
+    remontado (o sha256 do resultado passa a ser o desse envelope). offset e limit não estão no
+    siconfi.yaml; os nomes vêm do link next da própria resposta (ver ETAPA3_REDE.md).
+    """
+    def antes():
+        RITMO_SICONFI.aguardar(relogio, esperar)
+
+    url = url_siconfi(recurso, parametros)
+    conteudo = buscar(url, esperar, antes)
+    pagina = pagina_json(conteudo)
+    if not tem_mais(pagina):
+        return url, conteudo
+
+    itens, paginas = [], 1
+    while tem_mais(pagina):
+        if paginas >= TETO_PAGINAS:
+            raise FalhaColeta(f'O SICONFI continuou indicando mais páginas depois de {TETO_PAGINAS}; '
+                              'a consulta foi interrompida para não entrar em laço.', paginas)
+        limite = inteiro_envelope(pagina, 'limit', paginas)
+        if limite == 0:
+            raise FalhaColeta('Paginação do SICONFI com limit zero.', paginas)
+        proximo = inteiro_envelope(pagina, 'offset', paginas) + limite
+        itens += pagina['items']
+        pagina = pagina_json(buscar(url_siconfi(recurso, {**parametros, 'offset': proximo, 'limit': limite}),
+                                    esperar, antes))
+        paginas += 1
+    if not isinstance(pagina, dict) or not isinstance(pagina.get('items'), list):
+        raise FalhaColeta(f'A página {paginas} do SICONFI não trouxe a lista de itens.', paginas)
+    itens += pagina['items']
+    envelope = dict(items=itens, hasMore=False, limit=len(itens), offset=0, count=len(itens))
+    return url, json.dumps(envelope, ensure_ascii=False).encode('utf-8')
