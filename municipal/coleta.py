@@ -696,9 +696,10 @@ def coletar_populacao_municipios(cache: Path, ano: int, uf: int = UF_PADRAO,
 ENTREGAVEIS_RGF = {'Relatório de Gestão Fiscal Simplificado': 'RGF Simplificado',
                    'Relatório de Gestão Fiscal': 'RGF'}
 ULTIMO_PERIODO = dict(S=2, Q=3)
-# só homologado (HO), como pedido. A spec também tem RE (retificado): um período retificado continua
-# publicado, mas fica de fora até essa regra ser revista.
-STATUS_ENTREGUE = ('HO',)
+# a spec só define HO (homologado) e RE (retificado) em status_relatorio. Retificado continua publicado e
+# costuma ser mais correto que o original, então os dois contam como entregues.
+STATUS_ENTREGUE = ('HO', 'RE')
+NOME_STATUS = dict(HO='homologado', RE='retificado')
 # o exercício corrente costuma estar incompleto: consulta ele e os dois anteriores.
 EXERCICIOS_ATRAS = 2
 
@@ -723,7 +724,8 @@ def entregas_rgf(itens: list, id_ente: int) -> list[dict]:
                 and not isinstance(periodo, bool) and isinstance(periodo, int)
                 and 1 <= periodo <= ULTIMO_PERIODO[periodicidade]):
             entregas.append(dict(exercicio=exercicio, periodo=periodo, periodicidade=periodicidade,
-                                 demonstrativo=ENTREGAVEIS_RGF[i['entregavel']], data_status=i.get('data_status')))
+                                 demonstrativo=ENTREGAVEIS_RGF[i['entregavel']], data_status=i.get('data_status'),
+                                 status_relatorio=i['status_relatorio']))
     return entregas
 
 
@@ -748,7 +750,7 @@ def escolher_periodo(entregas: list[dict]) -> tuple[dict | None, dict | None]:
 def coletar_periodo_rgf(cache: Path, id_ente: int = MUNICIPIO_PADRAO, ano: int | None = None,
                         esperar: Callable[[float], None] = time.sleep, relogio: Callable[[], float] = time.monotonic,
                         agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
-    """último RGF de exercício fechado e homologado da Prefeitura, pelo /extrato_entregas."""
+    """último RGF de exercício fechado, homologado ou retificado, da Prefeitura, pelo /extrato_entregas."""
     ano = ano if ano is not None else agora().year
     anos = list(range(ano, ano - EXERCICIOS_ATRAS - 1, -1))
     urls = {a: url_siconfi('extrato_entregas', dict(id_ente=id_ente, an_referencia=a)) for a in anos}
@@ -771,11 +773,11 @@ def coletar_periodo_rgf(cache: Path, id_ente: int = MUNICIPIO_PADRAO, ano: int |
         aviso = f" Exercícios sem resposta: {' '.join(falhas)}" if falhas else ''
         if escolhido is None:
             return resultado('siconfi_extrato', urls[ano], 'sem_dados',
-                             f'Nenhum RGF de exercício fechado homologado pela Prefeitura em {anos[-1]}–{anos[0]}.' + aviso,
+                             f'Nenhum RGF de exercício fechado homologado ou retificado pela Prefeitura em {anos[-1]}–{anos[0]}.' + aviso,
                              conteudo=conteudo, checked_at=checked_at)
-        nota = (f"Último RGF de exercício fechado homologado pela Prefeitura: {escolhido['exercicio']}, "
+        nota = (f"Último RGF de exercício fechado publicado pela Prefeitura: {escolhido['exercicio']}, "
                 f"{nome_periodo(escolhido['periodo'], escolhido['periodicidade'])} ({escolhido['demonstrativo']}), "
-                f"homologado em {(escolhido['data_status'] or '')[:10]}.")
+                f"{NOME_STATUS[escolhido['status_relatorio']]} em {(escolhido['data_status'] or '')[:10]}.")
         if recente != escolhido:
             nota += (f" Há período mais recente publicado ({recente['exercicio']}, "
                      f"{nome_periodo(recente['periodo'], recente['periodicidade'])}), ainda sem o ano fechado; "
@@ -883,7 +885,7 @@ def coletar_rcl(cache: Path, id_ente: int = MUNICIPIO_PADRAO, esperar: Callable[
                                 'RREO Simplificado' if v['demonstrativo'] == 'RGF Simplificado' else 'RREO',
                                 esperar, relogio, agora, forcar)
         rgf = conferir_rcl(rgf, rreo)
-    escolha = {k: v[k] for k in ('exercicio', 'periodo', 'periodicidade', 'demonstrativo', 'data_status',
+    escolha = {k: v[k] for k in ('exercicio', 'periodo', 'periodicidade', 'demonstrativo', 'status_relatorio', 'data_status',
                                  'mais_recente_publicado')}
     return {**rgf, 'valores': {**rgf['valores'], 'escolha_periodo': escolha} if rgf['valores'] else {},
             'note': f"{rgf['note']} Período escolhido pelo extrato de entregas: {periodo['note']}"}

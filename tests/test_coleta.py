@@ -600,14 +600,24 @@ class ColetaRedeTests(unittest.TestCase):
         self.assertEqual((r['valores']['exercicio'],r['valores']['periodo']),(2024,2))
         self.assertIn('2025:',r['note'])
 
-    def test_rectified_report_is_not_taken_as_delivered(self):
+    def test_rectified_report_counts_as_published_and_its_status_is_recorded(self):
         extratos={2026:extrato(2026),2025:extrato(2025,status='RE'),2024:extrato(2024)}
         with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)):
             r=self.periodo()
-        self.assertEqual(r['valores']['exercicio'],2024)
+        self.assertEqual((r['valores']['exercicio'],r['valores']['periodo']),(2025,2))
+        self.assertEqual(r['valores']['status_relatorio'],'RE')
+        self.assertIn('retificado em 2026-02-23',r['note'])
 
-    def test_no_homologated_period_is_no_data(self):
-        extratos={a:extrato(a,status='RE') for a in (2024,2025,2026)}
+    def test_homologated_period_records_its_status(self):
+        extratos={a:extrato(a) for a in (2024,2025,2026)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos,rgf=fixture('siconfi_rgf_2025_s2.json'),
+                                                                   rreo=fixture('siconfi_rreo_2025_b6_anexo03.json'))):
+            r=coleta.coletar_rcl(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
+        self.assertEqual(r['valores']['escolha_periodo']['status_relatorio'],'HO')
+        self.assertIn('homologado em 2026-02-23',r['note'])
+
+    def test_no_published_period_is_no_data(self):
+        extratos={a:extrato(a,status='XX') for a in (2024,2025,2026)}
         with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)):
             r=self.periodo()
         self.assertEqual(r['status'],'sem_dados')
@@ -668,7 +678,7 @@ class ColetaRedeTests(unittest.TestCase):
                 self.assertIn('não pôde ser feita',r['note'])
 
     def test_rcl_without_a_period_does_not_query_the_rgf(self):
-        extratos={a:extrato(a,status='RE') for a in (2024,2025,2026)}
+        extratos={a:extrato(a,status='XX') for a in (2024,2025,2026)}
         with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)) as rede:
             r=coleta.coletar_rcl(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
         self.assertEqual(rede.call_count,3)
