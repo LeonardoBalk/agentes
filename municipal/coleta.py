@@ -24,6 +24,12 @@ COLETAS = [
 # "a api caiu" e "a api respondeu que não existe esse relatório".
 STATUS = ('nao_consultada', 'consultada', 'sem_dados', 'indisponivel')
 
+# lista de municípios: um valor ruim exclui só aquele município. Acima de 10% de perda o benchmark
+# deixa de representar a UF (no ES seriam 8 de 78); abaixo de 10 municípios a comparação per capita
+# vira anedota, mesmo que a perda seja pequena.
+EXCLUSAO_MAXIMA = 0.10
+MINIMO_MUNICIPIOS = 10
+
 
 def fonte(fonte_id: str) -> dict:
     for f in COLETAS:
@@ -239,22 +245,37 @@ def ler_populacao_municipios(conteudo: bytes, url: str, ano: int, checked_at: st
         if series is None:
             return resultado('ibge_populacao_municipios', url, 'sem_dados',
                              'O IBGE respondeu sem resultados para este período.', conteudo=conteudo, checked_at=checked_at)
-        municipios = {}
+        municipios, excluidos, repetidos = {}, [], set()
         for s in series:
             local = s['localidade']
-            nivel = local.get('nivel')
-            if not isinstance(nivel, dict) or nivel.get('id') != 'N6':
-                raise DataError(f'{url}: localidade {local.get("id")!r} não é município (N6).')
-            codigo = validar_codigo_ibge(local.get('id'), url)
-            if codigo in municipios:
-                raise DataError(f'{url}: município {codigo} repetido na resposta.')
-            # um município sem valor invalida a lista inteira: o benchmark não pode sair com buracos silenciosos.
-            if str(ano) not in s['serie']:
-                raise DataError(f'{url}: município {codigo} sem estimativa de {ano}.')
-            municipios[codigo] = dict(codigo_ibge=codigo, nome=local.get('nome'),
-                                      populacao=validar_populacao(s['serie'][str(ano)], f'{url} {codigo}/{ano}'))
-        return resultado('ibge_populacao_municipios', url, 'consultada',
-                         f'{len(municipios)} municípios, população residente estimada de {ano}. Identifique pelo código, não pelo nome.',
-                         dict(ano=int(ano), municipios=[municipios[c] for c in sorted(municipios)]), conteudo, checked_at)
+            try:
+                nivel = local.get('nivel')
+                if not isinstance(nivel, dict) or nivel.get('id') != 'N6':
+                    raise DataError(f'localidade {local.get("id")!r} não é município (N6).')
+                codigo = validar_codigo_ibge(local.get('id'), url)
+                if codigo in municipios or codigo in repetidos:
+                    # não há como saber qual das linhas repetidas é a certa: saem todas.
+                    if codigo in municipios:
+                        del municipios[codigo]
+                        excluidos.append(dict(codigo=codigo, motivo='código repetido na resposta.'))
+                    repetidos.add(codigo)
+                    raise DataError('código repetido na resposta.')
+                if str(ano) not in s['serie']:
+                    raise DataError(f'sem estimativa de {ano}.')
+                municipios[codigo] = dict(codigo_ibge=codigo, nome=local.get('nome'),
+                                          populacao=validar_populacao(s['serie'][str(ano)], f'{url} {codigo}/{ano}'))
+            except DataError as e:
+                excluidos.append(dict(codigo=local.get('id'), motivo=str(e)))
+        total = len(municipios) + len(excluidos)
+        valores = dict(ano=int(ano), municipios=[municipios[c] for c in sorted(municipios)],
+                       total_excluidos=len(excluidos), excluidos=excluidos)
+        nota = (f'{len(municipios)} municípios entraram e {len(excluidos)} '
+                f'{"foi excluído" if len(excluidos) == 1 else "foram excluídos"} por valor ausente ou inválido, '
+                f'população residente estimada de {ano}. Identifique pelo código, não pelo nome.')
+        if len(excluidos) > total * EXCLUSAO_MAXIMA or len(municipios) < MINIMO_MUNICIPIOS:
+            return resultado('ibge_populacao_municipios', url, 'indisponivel',
+                             nota + f' Perda acima do aceitável (máximo de {EXCLUSAO_MAXIMA:.0%} excluídos e '
+                             f'mínimo de {MINIMO_MUNICIPIOS} municípios).', conteudo=conteudo, checked_at=checked_at)
+        return resultado('ibge_populacao_municipios', url, 'consultada', nota, valores, conteudo, checked_at)
     except DataError as e:
         return resultado('ibge_populacao_municipios', url, 'indisponivel', str(e), conteudo=conteudo, checked_at=checked_at)

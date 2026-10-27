@@ -1,5 +1,6 @@
 """testes da leitura das respostas do SICONFI e do IBGE, sem rede."""
 
+import copy
 import hashlib
 import json
 import unittest
@@ -142,12 +143,42 @@ class ColetaTests(unittest.TestCase):
                     validar_populacao(valor,'teste')
         self.assertEqual(validar_populacao('13813','teste'),13813)
 
-    def test_invalid_population_inside_a_payload_makes_the_list_unavailable(self):
+    def test_one_municipality_without_value_is_dropped_and_the_list_survives(self):
         payload=json.loads(fixture('ibge_populacao_es.json'))
-        payload[0]['resultados'][0]['series'][5]['serie']['2025']='-'
+        serie=payload[0]['resultados'][0]['series'][5]
+        del serie['serie']['2025']
+        r=ler_populacao_municipios(json.dumps(payload).encode(),URL_IBGE,2025)
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual(len(r['valores']['municipios']),77)
+        self.assertEqual(r['valores']['total_excluidos'],1)
+        self.assertEqual([e['codigo'] for e in r['valores']['excluidos']],[serie['localidade']['id']])
+        self.assertIn('77 municípios entraram e 1 foi excluído',r['note'])
+
+    def test_invalid_or_repeated_municipalities_are_dropped_not_fatal(self):
+        payload=json.loads(fixture('ibge_populacao_es.json'))
+        series=payload[0]['resultados'][0]['series']
+        series[0]['serie']['2025']='-'
+        series[1]['localidade']['nivel']['id']='N3'
+        series.append(copy.deepcopy(series[2]))
+        r=ler_populacao_municipios(json.dumps(payload).encode(),URL_IBGE,2025)
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual(len(r['valores']['municipios']),75)
+        self.assertEqual(r['valores']['total_excluidos'],4)
+        self.assertNotIn(int(series[2]['localidade']['id']),{m['codigo_ibge'] for m in r['valores']['municipios']})
+
+    def test_state_list_losing_more_than_ten_percent_is_unavailable(self):
+        payload=json.loads(fixture('ibge_populacao_es.json'))
+        for s in payload[0]['resultados'][0]['series'][:8]:
+            s['serie']['2025']='...'
         r=ler_populacao_municipios(json.dumps(payload).encode(),URL_IBGE,2025)
         self.assertEqual(r['status'],'indisponivel')
-        self.assertEqual(r['valores'],{})
+        self.assertIn('8 foram excluídos',r['note'])
+
+    def test_state_list_with_too_few_municipalities_left_is_unavailable(self):
+        payload=json.loads(fixture('ibge_populacao_es.json'))
+        payload[0]['resultados'][0]['series']=payload[0]['resultados'][0]['series'][:9]
+        r=ler_populacao_municipios(json.dumps(payload).encode(),URL_IBGE,2025)
+        self.assertEqual(r['status'],'indisponivel')
 
     def test_monetary_validation_rejects_instead_of_converting(self):
         for valor in ('93629577.05',True,-1,float('nan'),float('inf'),None):
