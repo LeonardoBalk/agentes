@@ -313,10 +313,10 @@ class CoreTests(unittest.TestCase):
         reservas=[dict(tipo='crewai',model='gemini/lite',label='CrewAI / gemini/lite (reserva)'),
                   dict(tipo='groq',model='openai/gpt-oss-120b',label='Groq / openai/gpt-oss-120b (reserva, dados resumidos)')]
         modelos=[]
-        def crewai(dataset,scenario,sources,project,status):
+        def crewai(dataset,scenario,sources,project,status,publicos=None):
             modelos.append(status['model'])
             raise RuntimeError('503 UNAVAILABLE high demand')
-        def groq(dataset,scenario,sources,project,modelo,label):
+        def groq(dataset,scenario,sources,project,modelo,label,publicos=None):
             modelos.append(modelo)
             return dict(mode='ai',summary='ok',priorities=[],questions=[],source_ids=[],tool_log=[])
         with patch.object(agente,'ai_status',return_value=pronto),patch.object(agente,'reservas_configuradas',return_value=reservas),\
@@ -378,16 +378,16 @@ class CoreTests(unittest.TestCase):
         ids={a['id'] for a in agente.resumir_simulacao(scenario)['actions']}
         self.assertEqual(ids,{a['id'] for a in scenario['actions']})
 
-    def test_groq_loop_forces_the_three_tools_and_a_json_answer(self):
+    def test_groq_loop_forces_the_four_tools_and_a_json_answer(self):
         scenario=simulate(self.data)
         fontes=[dict(id='lrf',title='LRF',status='consultada',dispositivos=[])]
         pedidos=[]
         class Uso: total_tokens=100
         class Chamada:
-            def __init__(self,i,nome):
-                self.id=f'c{i}'; self.function=type('F',(),{'name':nome,'arguments':'{}'})()
+            def __init__(self,i,nome,argumentos='{}'):
+                self.id=f'c{i}'; self.function=type('F',(),{'name':nome,'arguments':argumentos})()
             def model_dump(self):
-                return dict(id=self.id,type='function',function=dict(name=self.function.name,arguments='{}'))
+                return dict(id=self.id,type='function',function=dict(name=self.function.name,arguments=self.function.arguments))
         def resposta(mensagem):
             return type('R',(),{'choices':[type('C',(),{'message':mensagem})()],'usage':Uso()})()
         final=json.dumps(dict(summary='Resumo da análise com propostas.',
@@ -399,7 +399,8 @@ class CoreTests(unittest.TestCase):
                 pedidos.append(kw)
                 if kw['tool_choice']=='required':
                     nomes=['consultar_indicadores','consultar_simulacao','consultar_fontes_oficiais']
-                    return resposta(type('M',(),{'content':None,'tool_calls':[Chamada(i,n) for i,n in enumerate(nomes)]})())
+                    chamadas=[Chamada(i,n) for i,n in enumerate(nomes)]+[Chamada(3,'consultar_dados_publicos','{"indicador":"tudo"}')]
+                    return resposta(type('M',(),{'content':None,'tool_calls':chamadas})())
                 return resposta(type('M',(),{'content':final,'tool_calls':None})())
         import openai
         with patch.object(openai,'OpenAI',Cliente),patch.dict('os.environ',{'GROQ_API_KEY':'gsk_teste'}):

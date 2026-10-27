@@ -16,7 +16,7 @@ from municipal.simulacao import simulate
 
 @unittest.skipUnless(importlib.util.find_spec('crewai'),'CrewAI opcional nao instalado')
 class CrewAITests(unittest.TestCase):
-    def test_real_crewai_calls_all_tools_and_returns_validated_output(self):
+    def test_real_crewai_calls_the_four_tools_and_returns_validated_output(self):
         requests=[]
         class Provider(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -24,8 +24,9 @@ class CrewAITests(unittest.TestCase):
                 requests.append(payload)
                 messages=payload.get('messages',[])
                 if not any(m.get('role')=='tool' for m in messages) and payload.get('tools'):
-                    calls=[dict(id=f'call_{i}',type='function',function=dict(name=t['function']['name'],arguments='{}'))
-                           for i,t in enumerate(payload['tools']) if t['function']['name'] in ('consultar_indicadores','consultar_simulacao','consultar_fontes_oficiais')]
+                    argumentos={'consultar_dados_publicos':json.dumps(dict(indicador='tudo'))}
+                    calls=[dict(id=f'call_{i}',type='function',function=dict(name=t['function']['name'],arguments=argumentos.get(t['function']['name'],'{}')))
+                           for i,t in enumerate(payload['tools']) if t['function']['name'] in ('consultar_indicadores','consultar_simulacao','consultar_fontes_oficiais','consultar_dados_publicos')]
                     message=dict(role='assistant',content=None,tool_calls=calls)
                     finish='tool_calls'
                 else:
@@ -52,10 +53,16 @@ class CrewAITests(unittest.TestCase):
             CREWAI_TRACING_ENABLED='false',OTEL_SDK_DISABLED='true',CREWAI_TELEMETRY_DISABLED='true')
         try:
             project=dict(answers=['Periodo confirmado pelo cliente: 12 meses.']+['']*10,consultant='NOME_DA_EQUIPE_NAO_ENVIAR')
+            publicos=dict(rcl=dict(id='siconfi_rgf_pessoal',status='consultada',desatualizado=False,note='RGF 2025.',
+                                   valores=dict(rcl=93_629_577.05)),
+                          benchmark=dict(id='benchmark_rcl_per_capita',status='nao_consultada',desatualizado=False,
+                                         note='Ainda não coletado.',valores={}))
             with patch.dict(os.environ,env):
-                result=run_agent(dataset,simulate(dataset),source,project)
+                result=run_agent(dataset,simulate(dataset),source,project,publicos)
             self.assertEqual(result['mode'],'ai')
-            self.assertEqual({c['tool'] for c in result['tool_log']},{'consultar_indicadores','consultar_simulacao','consultar_fontes_oficiais'})
+            self.assertEqual({c['tool'] for c in result['tool_log']},{'consultar_indicadores','consultar_simulacao','consultar_fontes_oficiais','consultar_dados_publicos'})
+            self.assertEqual([c['indicador'] for c in result['tool_log'] if c['tool']=='consultar_dados_publicos'],['tudo'])
+            self.assertIn('93629577.05',json.dumps(requests))
             self.assertEqual(result['source_ids'],['lrf'])
             self.assertGreaterEqual(len(requests),2)
             self.assertIn('Periodo confirmado pelo cliente',json.dumps(requests))

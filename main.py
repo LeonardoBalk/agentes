@@ -94,7 +94,7 @@ class Application:
             if mode=='ai' and coleta_vazia(external):
                 external=self.refresh_external(forcar=False)
             project=self.store.project()
-            analysis=run_agent(self.dataset,scenario,sources,project) if mode=='ai' else demo_analysis(self.dataset,scenario,sources)
+            analysis=run_agent(self.dataset,scenario,sources,project,external) if mode=='ai' else demo_analysis(self.dataset,scenario,sources)
             run=self.store.save_run(dict(analysis=analysis,scenario=scenario,sources=sources,external=external,
                 dataset=dict(filename=self.dataset['filename'],fingerprint=self.dataset['fingerprint'],
                              metrics=self.dataset['metrics'],warnings=self.dataset['warnings'],metric_sources=self.dataset['metric_sources']),
