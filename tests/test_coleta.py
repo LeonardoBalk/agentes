@@ -324,6 +324,7 @@ class ColetaRedeTests(unittest.TestCase):
         for codigo in (400,401,404):
             with self.subTest(codigo=codigo):
                 self.relogio.esperas.clear()
+                self.cache.unlink(missing_ok=True)
                 with patch('municipal.coleta.urlopen',side_effect=erro_http(codigo)) as rede:
                     r=self.populacao()
                 self.assertEqual(rede.call_count,1)
@@ -476,6 +477,58 @@ class ColetaRedeTests(unittest.TestCase):
         self.assertEqual(r['status'],'indisponivel')
         self.assertFalse(r['desatualizado'])
         self.assertEqual(r['valores'],{})
+
+    def test_backoff_returns_the_failure_without_calling_urlopen(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            self.populacao()
+        self.dia+=timedelta(minutes=2)
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('recuo ignorado')) as rede:
+            inicio=time.monotonic()
+            r=self.populacao()
+        rede.assert_not_called()
+        self.assertLess(time.monotonic()-inicio,0.5)
+        self.assertEqual(r['status'],'indisponivel')
+        self.assertIn('Nova tentativa automática em 3 min',r['note'])
+
+    def test_backoff_serves_the_last_good_value_as_stale(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
+            self.populacao()
+        self.dia+=timedelta(days=31)
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            self.populacao()
+        self.dia+=timedelta(minutes=1)
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('recuo ignorado')) as rede:
+            r=self.populacao()
+        rede.assert_not_called()
+        self.assertEqual(r['status'],'consultada')
+        self.assertTrue(r['desatualizado'])
+        self.assertIn('Nova tentativa automática em 4 min',r['note'])
+
+    def test_after_the_backoff_the_source_is_tried_again(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            self.populacao()
+        self.dia+=coleta.RECUO
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))) as rede:
+            r=self.populacao()
+        self.assertEqual(rede.call_count,1)
+        self.assertEqual(r['status'],'consultada')
+
+    def test_forcing_ignores_the_backoff(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            self.populacao()
+        self.dia+=timedelta(minutes=1)
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))) as rede:
+            r=coleta.coletar_populacao_municipio(self.cache,2025,esperar=self.relogio.esperar,agora=lambda:self.dia,
+                                                 forcar=True)
+        self.assertEqual(rede.call_count,1)
+        self.assertEqual(r['status'],'consultada')
+
+    def test_forcing_does_not_bypass_a_valid_cache(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
+            self.populacao()
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('cache válido ignorado')) as rede:
+            coleta.coletar_populacao_municipio(self.cache,2025,agora=lambda:self.dia,forcar=True)
+        rede.assert_not_called()
 
     def test_cache_write_is_atomic_and_leaves_no_temporary_file(self):
         with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):

@@ -506,6 +506,11 @@ def buscar_siconfi(recurso: str, parametros: dict, esperar: Callable[[float], No
 # atualizada em 28/08/2026, segundo /agregados/6579/periodos); 30 dias basta.
 VALIDADE = dict(siconfi_rgf_pessoal=timedelta(days=7), ibge_populacao=timedelta(days=30),
                 ibge_populacao_municipios=timedelta(days=30))
+# depois de uma falha, não tentar de novo antes disso. Cada falha completa custa até ~80 s (3 tentativas
+# com timeout de 20 s mais esperas de 5 e 15 s): 5 min evita que dois cliques seguidos em "atualizar"
+# paguem isso duas vezes, e é curto o bastante para a coleta voltar sozinha logo depois que a rede
+# voltar. Para tentar na hora, o botão de atualizar passa forcar=True.
+RECUO = timedelta(minutes=5)
 CHAVES_ENTRADA = {'url', 'ultimo_bom', 'ultimo_bom_em', 'ultima_tentativa', 'ultima_tentativa_em'}
 MUNICIPIO_PADRAO = 3204500   # Santa Leopoldina, confirmado na API de localidades do IBGE (ETAPA1_APIS.md)
 UF_PADRAO = 32               # Espírito Santo
@@ -569,8 +574,13 @@ def gravar_cache(cache: Path, dados: dict) -> None:
 
 
 def coletar(cache: Path, fonte_id: str, url: str, obter: Callable[[str], dict],
-            agora: Callable[[], datetime] = agora_utc) -> dict:
-    """devolve o valor do cache se ainda vale; senão consulta com obter(checked_at) e grava."""
+            agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
+    """devolve o valor do cache se ainda vale; senão consulta com obter(checked_at) e grava.
+
+    Logo depois de uma falha (RECUO), não consulta: devolve o último valor bom como desatualizado,
+    ou a própria falha. forcar=True ignora o recuo, para o botão de atualizar manual; ele não
+    ignora a validade, porque valor dentro da validade não precisa de rede.
+    """
     with TRAVA_COLETA:
         dados = ler_cache(cache)
         entrada = dados.get(fonte_id)
@@ -582,6 +592,16 @@ def coletar(cache: Path, fonte_id: str, url: str, obter: Callable[[str], dict],
         bom_em = entrada['ultimo_bom_em'] if entrada else None
         if bom and timedelta(0) <= momento - instante(bom_em) < VALIDADE[fonte_id]:
             return dict(bom)
+        ultima = entrada['ultima_tentativa'] if entrada else None
+        if not forcar and ultima and ultima['status'] != 'consultada':
+            desde = momento - instante(entrada['ultima_tentativa_em'])
+            if timedelta(0) <= desde < RECUO:
+                aviso = (f'Nova tentativa automática em {descrever_idade(RECUO - desde)}; '
+                         'o botão de atualizar tenta na hora.')
+                if bom:
+                    return valor_velho(bom, ultima, momento - instante(bom_em), aviso)
+                # sem valor bom: a própria falha, sem rede. Se ela foi sem_dados, continua sem_dados.
+                return {**ultima, 'note': f"{ultima['note']} {aviso}"}
         novo = obter(momento.isoformat())
         if novo['status'] == 'consultada':
             bom, bom_em = novo, momento.isoformat()
@@ -602,11 +622,11 @@ def descrever_idade(idade: timedelta) -> str:
     return f'{max(idade.seconds // 60, 1)} min'
 
 
-def valor_velho(bom: dict, falha: dict, idade: timedelta) -> dict:
+def valor_velho(bom: dict, falha: dict, idade: timedelta, aviso: str = '') -> dict:
     """último valor bom, marcado como desatualizado, com a idade e o motivo da falha na nota."""
-    return {**bom, 'desatualizado': True,
-            'note': f"{bom['note']} Valor coletado há {descrever_idade(idade)}; a atualização falhou "
-                    f"({falha['status']}): {falha['note']}"}
+    nota = (f"{bom['note']} Valor coletado há {descrever_idade(idade)}; a atualização falhou "
+            f"({falha['status']}): {falha['note']}")
+    return {**bom, 'desatualizado': True, 'note': f'{nota} {aviso}'.strip()}
 
 
 def obter_por(fonte_id: str, url: str, baixar_bytes: Callable[[], bytes],
@@ -624,7 +644,7 @@ def obter_por(fonte_id: str, url: str, baixar_bytes: Callable[[], bytes],
 def coletar_rgf_pessoal(cache: Path, exercicio: int, periodo: int, id_ente: int = MUNICIPIO_PADRAO,
                         periodicidade: str = 'S', demonstrativo: str = 'RGF Simplificado',
                         esperar: Callable[[float], None] = time.sleep, relogio: Callable[[], float] = time.monotonic,
-                        agora: Callable[[], datetime] = agora_utc) -> dict:
+                        agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
     """RGF-Anexo 01 do Executivo. Santa Leopoldina publica o simplificado semestral (ETAPA1_APIS.md)."""
     parametros = dict(an_exercicio=exercicio, in_periodicidade=periodicidade, nr_periodo=periodo,
                       co_tipo_demonstrativo=demonstrativo, no_anexo=ANEXO_PESSOAL, co_esfera='M',
@@ -633,7 +653,7 @@ def coletar_rgf_pessoal(cache: Path, exercicio: int, periodo: int, id_ente: int 
     obter = obter_por('siconfi_rgf_pessoal', url,
                       lambda: buscar_siconfi('rgf', parametros, esperar, relogio)[1],
                       lambda conteudo, checked_at: ler_rgf_pessoal(conteudo, url, checked_at))
-    return coletar(cache, 'siconfi_rgf_pessoal', url, obter, agora)
+    return coletar(cache, 'siconfi_rgf_pessoal', url, obter, agora, forcar)
 
 
 def url_populacao(ano: int, localidades: str) -> str:
@@ -643,17 +663,17 @@ def url_populacao(ano: int, localidades: str) -> str:
 
 def coletar_populacao_municipio(cache: Path, ano: int, codigo_ibge: int = MUNICIPIO_PADRAO,
                                 esperar: Callable[[float], None] = time.sleep,
-                                agora: Callable[[], datetime] = agora_utc) -> dict:
+                                agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
     url = url_populacao(ano, f'N6[{codigo_ibge}]')
     obter = obter_por('ibge_populacao', url, lambda: buscar(url, esperar),
                       lambda conteudo, checked_at: ler_populacao_municipio(conteudo, url, codigo_ibge, ano, checked_at))
-    return coletar(cache, 'ibge_populacao', url, obter, agora)
+    return coletar(cache, 'ibge_populacao', url, obter, agora, forcar)
 
 
 def coletar_populacao_municipios(cache: Path, ano: int, uf: int = UF_PADRAO,
                                  esperar: Callable[[float], None] = time.sleep,
-                                 agora: Callable[[], datetime] = agora_utc) -> dict:
+                                 agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
     url = url_populacao(ano, f'N6[N3[{uf}]]')
     obter = obter_por('ibge_populacao_municipios', url, lambda: buscar(url, esperar),
                       lambda conteudo, checked_at: ler_populacao_municipios(conteudo, url, ano, checked_at))
-    return coletar(cache, 'ibge_populacao_municipios', url, obter, agora)
+    return coletar(cache, 'ibge_populacao_municipios', url, obter, agora, forcar)
