@@ -33,7 +33,7 @@ class CrewAITests(unittest.TestCase):
                     diagnosis=dict(summary='Analise controlada de integracao. As bases precisam de revisao humana.',
                         priorities=[dict(action_id=i,reason='Conferir premissas, custos e prazo com o cliente.')
                                     for i in ('recuperar_divida','revisar_custeio','reduzir_folha','refis_iptu','ordenar_pagamentos')],
-                        questions=['Qual o periodo exato das despesas?'],source_ids=['lrf'])
+                        questions=['Qual o periodo exato das despesas?'],source_ids=['lrf','publico_rcl'])
                     message=dict(role='assistant',content=json.dumps(diagnosis))
                     finish='stop'
                 result=dict(id='chatcmpl-local-test',object='chat.completion',created=1,model='gpt-4o-mini',
@@ -63,7 +63,7 @@ class CrewAITests(unittest.TestCase):
             self.assertEqual({c['tool'] for c in result['tool_log']},{'consultar_indicadores','consultar_simulacao','consultar_fontes_oficiais','consultar_dados_publicos'})
             self.assertEqual([c['indicador'] for c in result['tool_log'] if c['tool']=='consultar_dados_publicos'],['tudo'])
             self.assertIn('93629577.05',json.dumps(requests))
-            self.assertEqual(result['source_ids'],['lrf'])
+            self.assertEqual(result['source_ids'],['lrf','publico_rcl'])
             self.assertGreaterEqual(len(requests),2)
             self.assertIn('Periodo confirmado pelo cliente',json.dumps(requests))
             self.assertNotIn('NOME_DA_EQUIPE_NAO_ENVIAR',json.dumps(requests))

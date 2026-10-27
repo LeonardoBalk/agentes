@@ -1,5 +1,6 @@
 """testes da ferramenta de dados públicos do agente, sem rede e sem LLM."""
 
+import importlib.util
 import json
 import unittest
 from pathlib import Path
@@ -85,6 +86,32 @@ class DadosPublicosTests(unittest.TestCase):
         consultar_publicos(PUBLICOS,'tudo',chamadas)
         validar_resposta(resposta(self.scenario,[]),self.scenario,[],chamadas)
         self.assertEqual(agente.ferramentas_chamadas(chamadas),FERRAMENTAS_OBRIGATORIAS)
+
+    def test_citing_public_data_that_was_not_requested_is_discarded(self):
+        chamadas=chamadas_basicas()
+        consultar_publicos(PUBLICOS,'rcl',chamadas)
+        with self.assertRaises(AgentError):
+            validar_resposta(resposta(self.scenario,['publico_benchmark']),self.scenario,[],chamadas)
+
+    def test_citing_requested_public_data_that_was_not_collected_is_discarded(self):
+        chamadas=chamadas_basicas()
+        consultar_publicos(PUBLICOS,'tudo',chamadas)
+        with self.assertRaises(AgentError):
+            validar_resposta(resposta(self.scenario,['publico_benchmark']),self.scenario,[],chamadas)
+
+    def test_citing_requested_and_collected_public_data_is_accepted(self):
+        chamadas=chamadas_basicas()
+        consultar_publicos(PUBLICOS,'tudo',chamadas)
+        fontes=[dict(id='lrf',status='consultada')]
+        validar_resposta(resposta(self.scenario,['lrf','publico_rcl']),self.scenario,fontes,chamadas)
+
+    @unittest.skipUnless(importlib.util.find_spec('pydantic'),'pydantic vem com as dependências de IA')
+    def test_answer_model_fits_every_citable_source_and_no_more(self):
+        Diagnostico=agente.criar_modelo_resposta()
+        ids=['lrf','lei4320','mdf','publico_rcl','publico_benchmark']
+        Diagnostico.model_validate(resposta(self.scenario,ids))
+        with self.assertRaises(Exception):
+            Diagnostico.model_validate(resposta(self.scenario,ids+['lrf']))
 
     def test_prompt_keeps_real_and_study_case_data_apart(self):
         prompt=agente.PROMPT_TAREFA
