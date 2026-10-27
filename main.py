@@ -22,6 +22,7 @@ except ImportError:
         return False
 
 from municipal.agente import AgentError, ai_status, demo_analysis, run_agent
+from municipal.coleta import atualizar_coleta, coleta_vazia, estado_coleta
 from municipal.dados import load_dataset
 from municipal.fontes import refresh_sources, source_status
 from municipal.simulacao import DEFAULTS, simulate, validate_inputs
@@ -42,17 +43,27 @@ class Application:
         self.store=Store(root/'runtime'/'municipal.sqlite3')
         self.source_cache=root/'runtime'/'sources.json'
         self.sources_lock=threading.Lock()
+        self.external_cache=root/'runtime'/'coleta.json'
+        self.external_lock=threading.Lock()
         self.jobs={}
         self.job_lock=threading.Lock()
 
     def state(self):
         return dict(dataset=self.dataset,defaults=DEFAULTS,scenario=simulate(self.dataset),
             ai=ai_status(),sources=source_status(self.source_cache),latest=self.store.latest(),
-            history=self.store.history(),project=self.store.project(),questions=QUESTIONS)
+            history=self.store.history(),project=self.store.project(),questions=QUESTIONS,external=self.external())
 
     def refresh(self):
         with self.sources_lock:
             return refresh_sources(self.source_cache)
+
+    def external(self):
+        # só cache: a tela inicial nunca espera rede
+        return estado_coleta(self.external_cache,self.dataset['metrics']['revenue'])
+
+    def refresh_external(self,forcar=True):
+        with self.external_lock:
+            return atualizar_coleta(self.external_cache,self.dataset['metrics']['revenue'],forcar=forcar)
 
     def start_run(self,body):
         if not isinstance(body,dict) or set(body)-{'mode','inputs'}:
@@ -79,9 +90,12 @@ class Application:
                 sources=self.refresh()
                 if not any(s['status']=='consultada' for s in sources):
                     raise AgentError('Não foi possível obter nenhuma fonte oficial. Consulte as fontes e tente novamente. O modo demonstração está disponível.')
+            external=self.external()
+            if mode=='ai' and coleta_vazia(external):
+                external=self.refresh_external(forcar=False)
             project=self.store.project()
             analysis=run_agent(self.dataset,scenario,sources,project) if mode=='ai' else demo_analysis(self.dataset,scenario,sources)
-            run=self.store.save_run(dict(analysis=analysis,scenario=scenario,sources=sources,
+            run=self.store.save_run(dict(analysis=analysis,scenario=scenario,sources=sources,external=external,
                 dataset=dict(filename=self.dataset['filename'],fingerprint=self.dataset['fingerprint'],
                              metrics=self.dataset['metrics'],warnings=self.dataset['warnings'],metric_sources=self.dataset['metric_sources']),
                 project=project,interview_complete=all(a.strip() for a in project['answers']),
@@ -137,6 +151,8 @@ def make_handler(app: Application):
                     return self.send(asset.read_bytes(),content_type=mime)
                 if path=='/api/state':
                     return self.send(app.state())
+                if path=='/api/external':
+                    return self.send(app.external())
                 if path.startswith('/api/jobs/'):
                     with app.job_lock:
                         job=app.jobs.get(path.rsplit('/',1)[-1])
@@ -190,6 +206,8 @@ def make_handler(app: Application):
                     return self.send(app.start_run(body),202)
                 if path=='/api/sources/refresh':
                     return self.send(app.refresh())
+                if path=='/api/external/refresh':
+                    return self.send(app.refresh_external())
                 if path=='/api/project':
                     return self.send(app.store.save_project(body))
                 if path=='/api/reviews':

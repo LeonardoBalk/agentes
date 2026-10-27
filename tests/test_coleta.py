@@ -779,6 +779,60 @@ class ColetaRedeTests(unittest.TestCase):
         rede.assert_not_called()
         self.assertEqual(segundo['valores'],primeiro['valores'])
 
+    def coletar_tudo(self):
+        extratos={a:extrato(a) for a in (2024,2025,2026)}
+        falso=siconfi(extratos,rgf=fixture('siconfi_rgf_2025_s2.json'),rreo=fixture('siconfi_rreo_2025_b6_anexo03.json'),
+                      pares=pares_sinteticos(),ibge=fixture('ibge_populacao_es.json'))
+        with patch('municipal.coleta.urlopen',side_effect=falso):
+            return coleta.atualizar_coleta(self.cache,577_300_000,esperar=self.relogio.esperar,relogio=self.relogio,
+                                           agora=lambda:self.dia)
+
+    def test_cache_only_state_never_touches_the_network(self):
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('a tela não pode esperar rede')) as rede:
+            vazio=coleta.estado_coleta(self.cache,577_300_000,agora=lambda:self.dia)
+        rede.assert_not_called()
+        self.assertEqual({k:r['status'] for k,r in vazio.items()},dict(rcl='nao_consultada',benchmark='nao_consultada'))
+        self.assertTrue(coleta.coleta_vazia(vazio))
+        self.assertFalse(self.cache.exists())
+
+    def test_refresh_fills_the_cache_and_the_state_reads_it_back(self):
+        estado=self.coletar_tudo()
+        self.assertEqual(estado['rcl']['status'],'consultada')
+        self.assertEqual(estado['rcl']['valores']['conferencia_rreo']['situacao'],'confere')
+        self.assertEqual(estado['benchmark']['valores']['mediana_pares'],7250.00)
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('não deveria acessar a rede')) as rede:
+            lido=coleta.estado_coleta(self.cache,577_300_000,agora=lambda:self.dia)
+        rede.assert_not_called()
+        self.assertEqual(lido,estado)
+
+    def test_cache_only_state_does_not_wait_for_a_collection_in_progress(self):
+        self.coletar_tudo()
+        with coleta.TRAVA_COLETA:
+            inicio=time.monotonic()
+            estado=coleta.estado_coleta(self.cache,agora=lambda:self.dia)
+        self.assertLess(time.monotonic()-inicio,0.5)
+        self.assertEqual(estado['rcl']['status'],'consultada')
+
+    def test_cache_only_state_marks_expired_values_as_stale(self):
+        self.coletar_tudo()
+        self.dia+=timedelta(days=40)
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('não deveria acessar a rede')):
+            estado=coleta.estado_coleta(self.cache,agora=lambda:self.dia)
+        self.assertEqual(estado['rcl']['status'],'consultada')
+        self.assertTrue(estado['rcl']['desatualizado'])
+        self.assertIn('validade de 7 dias venceu',estado['rcl']['note'])
+        self.assertTrue(estado['benchmark']['desatualizado'])
+
+    def test_benchmark_is_stale_when_the_municipality_rcl_is_stale(self):
+        self.coletar_tudo()
+        dados=coleta.ler_cache(self.cache)
+        velho=(self.dia-timedelta(days=8)).isoformat()
+        dados['siconfi_rgf_pessoal']['ultimo_bom_em']=velho
+        coleta.gravar_cache(self.cache,dados)
+        estado=coleta.estado_coleta(self.cache,agora=lambda:self.dia)
+        self.assertTrue(estado['rcl']['desatualizado'])
+        self.assertTrue(estado['benchmark']['desatualizado'])
+
     def test_cache_write_is_atomic_and_leaves_no_temporary_file(self):
         with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
             self.populacao()

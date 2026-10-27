@@ -582,14 +582,17 @@ def gravar_cache(cache: Path, dados: dict) -> None:
 
 
 def coletar(cache: Path, fonte_id: str, chave: str, obter: Callable[[str], dict],
-            agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
+            agora: Callable[[], datetime] = agora_utc, forcar: bool = False, somente_cache: bool = False) -> dict:
     """devolve o valor do cache se ainda vale; senão consulta com obter(checked_at) e grava.
 
     chave identifica a consulta: a URL, quando há uma só, ou a composição das consultas.
+    somente_cache=True nunca consulta a rede nem espera a trava: é o caminho da tela inicial.
     Logo depois de uma falha (RECUO), não consulta: devolve o último valor bom como desatualizado,
     ou a própria falha. forcar=True ignora o recuo, para o botão de atualizar manual; ele não
     ignora a validade, porque valor dentro da validade não precisa de rede.
     """
+    if somente_cache:
+        return do_cache(cache, fonte_id, chave, agora())
     with TRAVA_COLETA:
         dados = ler_cache(cache)
         entrada = dados.get(fonte_id)
@@ -620,6 +623,24 @@ def coletar(cache: Path, fonte_id: str, chave: str, obter: Callable[[str], dict]
         if novo['status'] == 'consultada' or bom is None:
             return novo
         return valor_velho(bom, novo, momento - instante(bom_em))
+
+
+def do_cache(cache: Path, fonte_id: str, chave: str, momento: datetime) -> dict:
+    """o que o cache tem para esta consulta, sem rede e sem trava (a gravação é atômica)."""
+    entrada = ler_cache(cache).get(fonte_id)
+    if not entrada or entrada['chave'] != chave:
+        return resultado(fonte_id, None, 'nao_consultada', 'Ainda não coletado. Use o botão de coletar.')
+    bom, ultima = entrada['ultimo_bom'], entrada['ultima_tentativa']
+    if not bom:
+        return dict(ultima)
+    idade = momento - instante(entrada['ultimo_bom_em'])
+    if timedelta(0) <= idade < VALIDADE[fonte_id]:
+        return dict(bom)
+    if ultima['status'] != 'consultada':
+        return valor_velho(bom, ultima, idade)
+    return {**bom, 'desatualizado': True,
+            'note': f"{bom['note']} Valor coletado há {descrever_idade(idade)}; a validade de "
+                    f"{VALIDADE[fonte_id].days} dias venceu e a tela não consulta a rede sozinha. Use o botão de coletar."}
 
 
 def descrever_idade(idade: timedelta) -> str:
@@ -653,7 +674,7 @@ def obter_por(fonte_id: str, url: str, baixar_bytes: Callable[[], bytes],
 def coletar_rgf_pessoal(cache: Path, exercicio: int, periodo: int, id_ente: int = MUNICIPIO_PADRAO,
                         periodicidade: str = 'S', demonstrativo: str = 'RGF Simplificado',
                         esperar: Callable[[float], None] = time.sleep, relogio: Callable[[], float] = time.monotonic,
-                        agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
+                        agora: Callable[[], datetime] = agora_utc, forcar: bool = False, somente_cache: bool = False) -> dict:
     """RGF-Anexo 01 do Executivo. Santa Leopoldina publica o simplificado semestral (ETAPA1_APIS.md)."""
     parametros = dict(an_exercicio=exercicio, in_periodicidade=periodicidade, nr_periodo=periodo,
                       co_tipo_demonstrativo=demonstrativo, no_anexo=ANEXO_PESSOAL, co_esfera='M',
@@ -662,7 +683,7 @@ def coletar_rgf_pessoal(cache: Path, exercicio: int, periodo: int, id_ente: int 
     obter = obter_por('siconfi_rgf_pessoal', url,
                       lambda: buscar_siconfi('rgf', parametros, esperar, relogio)[1],
                       lambda conteudo, checked_at: ler_rgf_pessoal(conteudo, url, checked_at))
-    return coletar(cache, 'siconfi_rgf_pessoal', url, obter, agora, forcar)
+    return coletar(cache, 'siconfi_rgf_pessoal', url, obter, agora, forcar, somente_cache)
 
 
 def url_populacao(ano: int, localidades: str) -> str:
@@ -672,20 +693,20 @@ def url_populacao(ano: int, localidades: str) -> str:
 
 def coletar_populacao_municipio(cache: Path, ano: int, codigo_ibge: int = MUNICIPIO_PADRAO,
                                 esperar: Callable[[float], None] = time.sleep,
-                                agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
+                                agora: Callable[[], datetime] = agora_utc, forcar: bool = False, somente_cache: bool = False) -> dict:
     url = url_populacao(ano, f'N6[{codigo_ibge}]')
     obter = obter_por('ibge_populacao', url, lambda: buscar(url, esperar),
                       lambda conteudo, checked_at: ler_populacao_municipio(conteudo, url, codigo_ibge, ano, checked_at))
-    return coletar(cache, 'ibge_populacao', url, obter, agora, forcar)
+    return coletar(cache, 'ibge_populacao', url, obter, agora, forcar, somente_cache)
 
 
 def coletar_populacao_municipios(cache: Path, ano: int, uf: int = UF_PADRAO,
                                  esperar: Callable[[float], None] = time.sleep,
-                                 agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
+                                 agora: Callable[[], datetime] = agora_utc, forcar: bool = False, somente_cache: bool = False) -> dict:
     url = url_populacao(ano, f'N6[N3[{uf}]]')
     obter = obter_por('ibge_populacao_municipios', url, lambda: buscar(url, esperar),
                       lambda conteudo, checked_at: ler_populacao_municipios(conteudo, url, ano, checked_at))
-    return coletar(cache, 'ibge_populacao_municipios', url, obter, agora, forcar)
+    return coletar(cache, 'ibge_populacao_municipios', url, obter, agora, forcar, somente_cache)
 
 
 
@@ -749,7 +770,7 @@ def escolher_periodo(entregas: list[dict]) -> tuple[dict | None, dict | None]:
 
 def coletar_periodo_rgf(cache: Path, id_ente: int = MUNICIPIO_PADRAO, ano: int | None = None,
                         esperar: Callable[[float], None] = time.sleep, relogio: Callable[[], float] = time.monotonic,
-                        agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
+                        agora: Callable[[], datetime] = agora_utc, forcar: bool = False, somente_cache: bool = False) -> dict:
     """último RGF de exercício fechado, homologado ou retificado, da Prefeitura, pelo /extrato_entregas."""
     ano = ano if ano is not None else agora().year
     anos = list(range(ano, ano - EXERCICIOS_ATRAS - 1, -1))
@@ -785,7 +806,7 @@ def coletar_periodo_rgf(cache: Path, id_ente: int = MUNICIPIO_PADRAO, ano: int |
         valores = dict(escolhido, mais_recente_publicado=recente, exercicios_consultados=anos)
         return resultado('siconfi_extrato', urls[ano], 'consultada', nota + aviso, valores, conteudo, checked_at)
 
-    return coletar(cache, 'siconfi_extrato', ' '.join(urls[a] for a in anos), obter, agora, forcar)
+    return coletar(cache, 'siconfi_extrato', ' '.join(urls[a] for a in anos), obter, agora, forcar, somente_cache)
 
 
 ANEXO_RCL_RREO = 'RREO-Anexo 03'
@@ -827,13 +848,13 @@ def ler_rreo_rcl(conteudo: bytes, url: str, checked_at: str | None = None) -> di
 def coletar_rreo_rcl(cache: Path, exercicio: int, bimestre: int, id_ente: int = MUNICIPIO_PADRAO,
                      demonstrativo: str = 'RREO Simplificado', esperar: Callable[[float], None] = time.sleep,
                      relogio: Callable[[], float] = time.monotonic, agora: Callable[[], datetime] = agora_utc,
-                     forcar: bool = False) -> dict:
+                     forcar: bool = False, somente_cache: bool = False) -> dict:
     parametros = dict(an_exercicio=exercicio, nr_periodo=bimestre, co_tipo_demonstrativo=demonstrativo,
                       no_anexo=ANEXO_RCL_RREO, co_esfera='M', id_ente=id_ente)
     url = url_siconfi('rreo', parametros)
     obter = obter_por('siconfi_rreo_rcl', url, lambda: buscar_siconfi('rreo', parametros, esperar, relogio)[1],
                       lambda conteudo, checked_at: ler_rreo_rcl(conteudo, url, checked_at))
-    return coletar(cache, 'siconfi_rreo_rcl', url, obter, agora, forcar)
+    return coletar(cache, 'siconfi_rreo_rcl', url, obter, agora, forcar, somente_cache)
 
 
 def reais(valor: float) -> str:
@@ -869,21 +890,23 @@ def conferir_rcl(rgf: dict, rreo: dict) -> dict:
 
 def coletar_rcl(cache: Path, id_ente: int = MUNICIPIO_PADRAO, esperar: Callable[[float], None] = time.sleep,
                 relogio: Callable[[], float] = time.monotonic, agora: Callable[[], datetime] = agora_utc,
-                forcar: bool = False) -> dict:
+                forcar: bool = False, somente_cache: bool = False) -> dict:
     """RGF-Anexo 01 do último exercício fechado publicado, escolhido pelo extrato de entregas."""
-    periodo = coletar_periodo_rgf(cache, id_ente, None, esperar, relogio, agora, forcar)
+    periodo = coletar_periodo_rgf(cache, id_ente, None, esperar, relogio, agora, forcar, somente_cache)
+    if periodo['status'] == 'nao_consultada':
+        return resultado('siconfi_rgf_pessoal', None, 'nao_consultada', periodo['note'])
     if periodo['status'] != 'consultada':
         return resultado('siconfi_rgf_pessoal', None, periodo['status'],
                          f"Período do RGF não determinado pelo extrato de entregas. {periodo['note']}",
                          checked_at=periodo['checked_at'])
     v = periodo['valores']
     rgf = coletar_rgf_pessoal(cache, v['exercicio'], v['periodo'], id_ente, v['periodicidade'], v['demonstrativo'],
-                              esperar, relogio, agora, forcar)
+                              esperar, relogio, agora, forcar, somente_cache)
     if rgf['status'] == 'consultada':
         # conferência opcional: o RREO só acrescenta uma nota, nunca muda o status do RGF.
         rreo = coletar_rreo_rcl(cache, v['exercicio'], BIMESTRE_DO_RGF[(v['periodicidade'], v['periodo'])], id_ente,
                                 'RREO Simplificado' if v['demonstrativo'] == 'RGF Simplificado' else 'RREO',
-                                esperar, relogio, agora, forcar)
+                                esperar, relogio, agora, forcar, somente_cache)
         rgf = conferir_rcl(rgf, rreo)
     escolha = {k: v[k] for k in ('exercicio', 'periodo', 'periodicidade', 'demonstrativo', 'status_relatorio', 'data_status',
                                  'mais_recente_publicado')}
@@ -941,7 +964,8 @@ def rgf_de_par(codigo_ibge: int, exercicio: int, esperar: Callable[[float], None
 
 
 def coletar_pares(cache: Path, pares: list[dict], exercicio: int, chave: str, esperar: Callable[[float], None],
-                  relogio: Callable[[], float], agora: Callable[[], datetime], forcar: bool) -> dict:
+                  relogio: Callable[[], float], agora: Callable[[], datetime], forcar: bool,
+                  somente_cache: bool = False) -> dict:
     """RCL por habitante de cada par; par sem dado sai da lista com registro."""
     def obter(checked_at: str) -> dict:
         validos, excluidos = [], []
@@ -962,7 +986,7 @@ def coletar_pares(cache: Path, pares: list[dict], exercicio: int, chave: str, es
                              dict(valores, pares=[]), checked_at=checked_at)
         return resultado('benchmark_rcl_per_capita', None, 'consultada', nota, valores, checked_at=checked_at)
 
-    return coletar(cache, 'benchmark_rcl_per_capita', chave, obter, agora, forcar)
+    return coletar(cache, 'benchmark_rcl_per_capita', chave, obter, agora, forcar, somente_cache)
 
 
 def aviso_estudo_de_caso(nome: str, exercicio: int, receita_estudo_hab: float, rcl_hab: float) -> str:
@@ -979,21 +1003,23 @@ def aviso_estudo_de_caso(nome: str, exercicio: int, receita_estudo_hab: float, r
 def coletar_benchmark(cache: Path, receita_estudo: float | None = None, id_ente: int = MUNICIPIO_PADRAO,
                       uf: int = UF_PADRAO, esperar: Callable[[float], None] = time.sleep,
                       relogio: Callable[[], float] = time.monotonic, agora: Callable[[], datetime] = agora_utc,
-                      forcar: bool = False) -> dict:
+                      forcar: bool = False, somente_cache: bool = False) -> dict:
     """RCL por habitante do município ao lado da mediana dos pares de porte semelhante na UF.
 
     receita_estudo é a receita arrecadada da planilha (dataset['metrics']['revenue']); quando vem, o
     resultado traz o aviso de que o estudo de caso não usa os valores publicados do município.
     """
     def sem(status: str, nota: str, checked_at=None) -> dict:
+        if status == 'nao_consultada':
+            return resultado('benchmark_rcl_per_capita', None, status, 'Ainda não coletado. Use o botão de coletar.')
         return resultado('benchmark_rcl_per_capita', None, status if status != 'consultada' else 'sem_dados',
                          nota, checked_at=checked_at)
 
-    rcl = coletar_rcl(cache, id_ente, esperar, relogio, agora, forcar)
+    rcl = coletar_rcl(cache, id_ente, esperar, relogio, agora, forcar, somente_cache)
     if rcl['status'] != 'consultada':
         return sem(rcl['status'], f"Sem a RCL do município. {rcl['note']}", rcl['checked_at'])
     exercicio = rcl['valores']['exercicio']
-    lista = coletar_populacao_municipios(cache, exercicio, uf, esperar, agora, forcar)
+    lista = coletar_populacao_municipios(cache, exercicio, uf, esperar, agora, forcar, somente_cache)
     if lista['status'] != 'consultada':
         return sem(lista['status'], f"Sem a população dos municípios em {exercicio}. {lista['note']}", lista['checked_at'])
     municipio = next((m for m in lista['valores']['municipios'] if m['codigo_ibge'] == id_ente), None)
@@ -1005,7 +1031,7 @@ def coletar_benchmark(cache: Path, receita_estudo: float | None = None, id_ente:
 
     chave = (f"benchmark rcl_per_capita uf={uf} ente={id_ente} exercicio={exercicio} "
              f"pares={','.join(str(p['codigo_ibge']) for p in pares)}")
-    r = coletar_pares(cache, pares, exercicio, chave, esperar, relogio, agora, forcar)
+    r = coletar_pares(cache, pares, exercicio, chave, esperar, relogio, agora, forcar, somente_cache)
     if r['status'] != 'consultada':
         return r
 
@@ -1030,4 +1056,28 @@ def coletar_benchmark(cache: Path, receita_estudo: float | None = None, id_ente:
         valores['comparacao_estudo'] = dict(receita_estudo=receita, receita_estudo_per_capita=receita_hab,
                                             rcl_per_capita=valor, razao=round(receita_hab / valor, 2), aviso=aviso)
         nota += ' Aviso: ' + aviso
-    return {**r, 'valores': valores, 'note': nota}
+    # desatualizado se qualquer dado de entrada estiver; o extrato fica de fora (validade de 1 dia, só escolhe o período).
+    return {**r, 'valores': valores, 'note': nota,
+            'desatualizado': r['desatualizado'] or rcl['desatualizado'] or lista['desatualizado']}
+
+
+
+# ---------------------------------------------------------------- estado para a tela e para o agente
+
+def estado_coleta(cache: Path, receita_estudo: float | None = None,
+                  agora: Callable[[], datetime] = agora_utc) -> dict:
+    """RCL e benchmark só do cache: nunca consulta a rede nem espera uma coleta em andamento."""
+    return dict(rcl=coletar_rcl(cache, agora=agora, somente_cache=True),
+                benchmark=coletar_benchmark(cache, receita_estudo, agora=agora, somente_cache=True))
+
+
+def atualizar_coleta(cache: Path, receita_estudo: float | None = None, forcar: bool = False,
+                     esperar: Callable[[float], None] = time.sleep, relogio: Callable[[], float] = time.monotonic,
+                     agora: Callable[[], datetime] = agora_utc) -> dict:
+    """coleta o que faltar ou tiver vencido (o benchmark puxa a RCL) e devolve o estado do cache."""
+    coletar_benchmark(cache, receita_estudo, esperar=esperar, relogio=relogio, agora=agora, forcar=forcar)
+    return estado_coleta(cache, receita_estudo, agora)
+
+
+def coleta_vazia(estado: dict) -> bool:
+    return all(r['status'] == 'nao_consultada' for r in estado.values())
