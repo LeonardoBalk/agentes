@@ -9,6 +9,7 @@ import math
 import re
 import threading
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -301,7 +302,8 @@ TETO_BYTES = 4_000_000
 # o fontes.py se passa por navegador porque o planalto.gov.br exige. SICONFI e IBGE responderam ao
 # curl na etapa 1, então aqui o app se identifica. Accept-Language é o mesmo do fontes.py.
 CABECALHOS = {'User-Agent': 'LeopoldinAI/1.0 (coleta de dados fiscais)',
-              'Accept-Language': 'pt-BR,pt;q=0.9', 'Accept': 'application/json'}
+              'Accept-Language': 'pt-BR,pt;q=0.9', 'Accept': 'application/json',
+              'Accept-Encoding': 'gzip'}
 
 
 class FalhaRede(Exception):
@@ -317,6 +319,7 @@ def baixar(url: str) -> tuple[int, bytes]:
         try:
             with urlopen(Request(url, headers=CABECALHOS), timeout=TIMEOUT) as resposta:
                 status, conteudo = resposta.status, resposta.read(TETO_BYTES + 1)
+                codificacao = (resposta.headers.get('Content-Encoding') or '').strip().lower()
         except HTTPError as e:
             # urllib levanta exceção em 4xx/5xx; o código decide a repetição, o corpo é só complemento.
             status = e.code
@@ -326,13 +329,31 @@ def baixar(url: str) -> tuple[int, bytes]:
                 conteudo = b''
             finally:
                 e.close()
+            # corpo de erro não é lido por ninguém; não vale descompactar.
+            codificacao = ''
     except (OSError, http.client.HTTPException) as e:
         # OSError cobre timeout, conexão recusada e DNS; URLError é subclasse e guarda a causa em reason.
         causa = e.reason if isinstance(getattr(e, 'reason', None), BaseException) else e
         raise FalhaRede(f'falha de rede ({type(causa).__name__})', passageira=True) from e
     if len(conteudo) > TETO_BYTES:
         raise FalhaRede(f'resposta maior que {TETO_BYTES // 1_000_000} MB', passageira=False)
-    return status, conteudo
+    return status, descompactar(conteudo, codificacao)
+
+
+def descompactar(conteudo: bytes, codificacao: str) -> bytes:
+    """o IBGE manda gzip mesmo sem Accept-Encoding (visto na lista da UF); o teto vale para o descompactado."""
+    if codificacao in ('', 'identity'):
+        return conteudo
+    if codificacao != 'gzip':
+        raise FalhaRede(f'codificação de resposta não suportada ({codificacao})', passageira=False)
+    leitor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        bruto = leitor.decompress(conteudo, TETO_BYTES + 1)
+    except zlib.error as e:
+        raise FalhaRede('resposta gzip corrompida', passageira=False) from e
+    if len(bruto) > TETO_BYTES or leitor.unconsumed_tail:
+        raise FalhaRede(f'resposta descompactada maior que {TETO_BYTES // 1_000_000} MB', passageira=False)
+    return bruto
 
 
 # mesmo padrão e mesmos valores de agente.py (TENTATIVAS, ESPERAS), mas sem reaproveitar o código: lá a
