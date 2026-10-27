@@ -173,3 +173,88 @@ def ler_rgf_pessoal(conteudo: bytes, url: str, checked_at: str | None = None) ->
         return resultado('siconfi_rgf_pessoal', url, 'consultada', nota, valores, conteudo, checked_at)
     except DataError as e:
         return falha(str(e))
+
+
+# ---------------------------------------------------------------- ibge população
+
+AGREGADO_POPULACAO = 6579
+VARIAVEL_POPULACAO = '9324'
+
+
+def series_populacao(payload: Any, rotulo: str) -> list[dict] | None:
+    """séries da variável 9324; None quando a api respondeu lista vazia (período sem dado)."""
+    if not isinstance(payload, list):
+        raise DataError(f'{rotulo}: resposta não é a lista de variáveis do IBGE.')
+    if not payload:
+        return None
+    variaveis = [v for v in payload if isinstance(v, dict) and v.get('id') == VARIAVEL_POPULACAO]
+    if len(variaveis) != 1:
+        raise DataError(f'{rotulo}: variável {VARIAVEL_POPULACAO} ausente ou repetida na resposta.')
+    resultados = variaveis[0].get('resultados')
+    if not isinstance(resultados, list):
+        raise DataError(f'{rotulo}: variável {VARIAVEL_POPULACAO} sem resultados.')
+    series = []
+    for r in resultados:
+        if not isinstance(r, dict) or not isinstance(r.get('series'), list):
+            raise DataError(f'{rotulo}: resultado sem séries.')
+        series.extend(r['series'])
+    if not all(isinstance(s, dict) and isinstance(s.get('localidade'), dict) and isinstance(s.get('serie'), dict)
+               for s in series):
+        raise DataError(f'{rotulo}: série sem localidade ou valores.')
+    return series or None
+
+
+def ler_populacao_municipio(conteudo: bytes, url: str, codigo_ibge: int, ano: int,
+                            checked_at: str | None = None) -> dict:
+    """população de um município num ano, a partir da consulta N6[codigo]."""
+    def sem_dados(nota):
+        return resultado('ibge_populacao', url, 'sem_dados', nota, conteudo=conteudo, checked_at=checked_at)
+    try:
+        series = series_populacao(ler_json(conteudo, url), url)
+        if series is None:
+            return sem_dados('O IBGE respondeu sem resultados para este período.')
+        # o nome muda de formato entre consultas ("(ES)" x "- ES"); o município é identificado só pelo id.
+        do_municipio = [s for s in series if s['localidade'].get('id') == str(codigo_ibge)]
+        if not do_municipio:
+            return sem_dados(f'Município {codigo_ibge} ausente da resposta do IBGE.')
+        if len(do_municipio) > 1:
+            raise DataError(f'{url}: município {codigo_ibge} repetido na resposta.')
+        serie = do_municipio[0]
+        if str(ano) not in serie['serie']:
+            return sem_dados(f'O IBGE não publicou estimativa de {ano} para o município {codigo_ibge}.')
+        valores = dict(codigo_ibge=validar_codigo_ibge(serie['localidade']['id'], url), ano=int(ano),
+                       populacao=validar_populacao(serie['serie'][str(ano)], f'{url} {codigo_ibge}/{ano}'),
+                       nome=serie['localidade'].get('nome'))
+        return resultado('ibge_populacao', url, 'consultada',
+                         f'População residente estimada de {ano}, agregado {AGREGADO_POPULACAO}, variável {VARIAVEL_POPULACAO}.',
+                         valores, conteudo, checked_at)
+    except DataError as e:
+        return resultado('ibge_populacao', url, 'indisponivel', str(e), conteudo=conteudo, checked_at=checked_at)
+
+
+def ler_populacao_municipios(conteudo: bytes, url: str, ano: int, checked_at: str | None = None) -> dict:
+    """código, nome e população de cada município, a partir de uma consulta como N6[N3[32]]."""
+    try:
+        series = series_populacao(ler_json(conteudo, url), url)
+        if series is None:
+            return resultado('ibge_populacao_municipios', url, 'sem_dados',
+                             'O IBGE respondeu sem resultados para este período.', conteudo=conteudo, checked_at=checked_at)
+        municipios = {}
+        for s in series:
+            local = s['localidade']
+            nivel = local.get('nivel')
+            if not isinstance(nivel, dict) or nivel.get('id') != 'N6':
+                raise DataError(f'{url}: localidade {local.get("id")!r} não é município (N6).')
+            codigo = validar_codigo_ibge(local.get('id'), url)
+            if codigo in municipios:
+                raise DataError(f'{url}: município {codigo} repetido na resposta.')
+            # um município sem valor invalida a lista inteira: o benchmark não pode sair com buracos silenciosos.
+            if str(ano) not in s['serie']:
+                raise DataError(f'{url}: município {codigo} sem estimativa de {ano}.')
+            municipios[codigo] = dict(codigo_ibge=codigo, nome=local.get('nome'),
+                                      populacao=validar_populacao(s['serie'][str(ano)], f'{url} {codigo}/{ano}'))
+        return resultado('ibge_populacao_municipios', url, 'consultada',
+                         f'{len(municipios)} municípios, população residente estimada de {ano}. Identifique pelo código, não pelo nome.',
+                         dict(ano=int(ano), municipios=[municipios[c] for c in sorted(municipios)]), conteudo, checked_at)
+    except DataError as e:
+        return resultado('ibge_populacao_municipios', url, 'indisponivel', str(e), conteudo=conteudo, checked_at=checked_at)
