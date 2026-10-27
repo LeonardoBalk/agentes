@@ -602,11 +602,50 @@ class ColetaRedeTests(unittest.TestCase):
         extratos={a:extrato(a) for a in (2024,2025,2026)}
         with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos,rgf=fixture('siconfi_rgf_2025_s2.json'))) as rede:
             r=coleta.coletar_rcl(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
-        url_rgf=rede.call_args_list[-1].args[0].full_url
+        urls=[c.args[0].full_url for c in rede.call_args_list]
+        url_rgf=[x for x in urls if '/rgf?' in x][0]
         self.assertIn('an_exercicio=2025&in_periodicidade=S&nr_periodo=2',url_rgf)
+        url_rreo=[x for x in urls if '/rreo?' in x][0]
+        self.assertIn('an_exercicio=2025&nr_periodo=6&co_tipo_demonstrativo=RREO%20Simplificado',url_rreo)
         self.assertEqual(r['status'],'consultada')
         self.assertEqual(r['valores']['escolha_periodo']['exercicio'],2025)
         self.assertIn('Período escolhido pelo extrato',r['note'])
+
+    def rcl(self,rreo):
+        extratos={a:extrato(a) for a in (2024,2025,2026)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos,rgf=fixture('siconfi_rgf_2025_s2.json'),rreo=rreo)):
+            return coleta.coletar_rcl(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
+
+    def test_rcl_matching_the_rreo_is_recorded_as_checked(self):
+        r=self.rcl(fixture('siconfi_rreo_2025_b6_anexo03.json'))
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual(r['valores']['conferencia_rreo'],dict(situacao='confere',rcl_rreo=93_629_577.05,diferenca=0.0))
+        self.assertIn('confere com a do RREO',r['note'])
+
+    def test_rcl_diverging_from_the_rreo_stays_consulted_and_notes_both_values(self):
+        payload=json.loads(fixture('siconfi_rreo_2025_b6_anexo03.json'))
+        for i in payload['items']:
+            if i['cod_conta']=='RREO3ReceitaCorrenteLiquida' and i['coluna']=='TOTAL (ÚLTIMOS 12 MESES)':
+                i['valor']=93_000_000.00
+        r=self.rcl(json.dumps(payload).encode())
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual(r['valores']['rcl'],93_629_577.05)
+        self.assertEqual(r['valores']['conferencia_rreo']['situacao'],'diverge')
+        self.assertEqual(r['valores']['conferencia_rreo']['diferenca'],629_577.05)
+        self.assertIn('R$ 93.629.577,05',r['note'])
+        self.assertIn('R$ 93.000.000,00',r['note'])
+        self.assertIn('diferença de R$ 629.577,05',r['note'])
+
+    def test_missing_rreo_does_not_affect_the_rgf(self):
+        referencia=ler_rgf_pessoal(fixture('siconfi_rgf_2025_s2.json'),URL_RGF)['valores']
+        for rreo in (fixture('siconfi_rgf_erro_sem_id_ente.json'),erro_http(500)):
+            with self.subTest(rreo=rreo if isinstance(rreo,bytes) else 'HTTP 500'):
+                self.cache.unlink(missing_ok=True)
+                r=self.rcl(rreo)
+                self.assertEqual(r['status'],'consultada')
+                self.assertEqual(r['valores']['conferencia_rreo']['situacao'],'nao_feita')
+                self.assertEqual({k:r['valores'][k] for k in referencia},referencia)
+                self.assertIn('não pôde ser feita',r['note'])
 
     def test_rcl_without_a_period_does_not_query_the_rgf(self):
         extratos={a:extrato(a,status='RE') for a in (2024,2025,2026)}

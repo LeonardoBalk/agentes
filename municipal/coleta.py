@@ -27,6 +27,7 @@ COLETAS = [
     dict(id='ibge_populacao', title='IBGE - População residente estimada do município (agregado 6579)'),
     dict(id='ibge_populacao_municipios', title='IBGE - População residente estimada dos municípios (agregado 6579)'),
     dict(id='siconfi_extrato', title='SICONFI - Extrato de entregas: último RGF publicado pela Prefeitura'),
+    dict(id='siconfi_rreo_rcl', title='SICONFI - RREO, Anexo 03: RCL dos últimos 12 meses (conferência)'),
 ]
 
 # sem_dados é o único status novo: o SICONFI responde HTTP 200 com items vazio quando não há
@@ -508,7 +509,8 @@ def buscar_siconfi(recurso: str, parametros: dict, esperar: Callable[[float], No
 # o extrato é o que mais muda: cada entrega ou retificação nova aparece nele. São 3 consultas
 # pequenas; 1 dia faz a escolha do período acompanhar uma publicação nova no dia seguinte.
 VALIDADE = dict(siconfi_rgf_pessoal=timedelta(days=7), ibge_populacao=timedelta(days=30),
-                ibge_populacao_municipios=timedelta(days=30), siconfi_extrato=timedelta(days=1))
+                ibge_populacao_municipios=timedelta(days=30), siconfi_extrato=timedelta(days=1),
+                siconfi_rreo_rcl=timedelta(days=7))
 # depois de uma falha, não tentar de novo antes disso. Cada falha completa custa até ~80 s (3 tentativas
 # com timeout de 20 s mais esperas de 5 e 15 s): 5 min evita que dois cliques seguidos em "atualizar"
 # paguem isso duas vezes, e é curto o bastante para a coleta voltar sozinha logo depois que a rede
@@ -781,6 +783,85 @@ def coletar_periodo_rgf(cache: Path, id_ente: int = MUNICIPIO_PADRAO, ano: int |
     return coletar(cache, 'siconfi_extrato', ' '.join(urls[a] for a in anos), obter, agora, forcar)
 
 
+ANEXO_RCL_RREO = 'RREO-Anexo 03'
+CAMPO_RCL_RREO = ('RREO3ReceitaCorrenteLiquida', 'TOTAL (ÚLTIMOS 12 MESES)')
+# bimestre do RREO que fecha no mesmo mês que o período do RGF; as duas RCL cobrem os mesmos 12 meses.
+BIMESTRE_DO_RGF = {('S', 1): 3, ('S', 2): 6, ('Q', 1): 2, ('Q', 2): 4, ('Q', 3): 6}
+# os dois demonstrativos saem da mesma contabilidade e da mesma janela de 12 meses: diferença acima de
+# centavos de arredondamento indica que um deles foi retificado e o outro não.
+TOLERANCIA_RCL = 1.00
+
+
+def ler_rreo_rcl(conteudo: bytes, url: str, checked_at: str | None = None) -> dict:
+    """RCL dos últimos 12 meses do RREO-Anexo 03, a partir dos bytes do /rreo."""
+    def falha(nota):
+        return resultado('siconfi_rreo_rcl', url, 'indisponivel', nota, conteudo=conteudo, checked_at=checked_at)
+    try:
+        payload = ler_json(conteudo, url)
+        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            return falha('Resposta sem a lista de itens do SICONFI.')
+        if not payload['items'] or payload.get('count') == 0:
+            return resultado('siconfi_rreo_rcl', url, 'sem_dados', 'O SICONFI respondeu sem registros do RREO para estes parâmetros.',
+                             conteudo=conteudo, checked_at=checked_at)
+        if payload.get('hasMore') is not False:
+            return falha('Resposta do RREO truncada ou sem o indicador hasMore.')
+        linhas = [i for i in payload['items'] if isinstance(i, dict) and i.get('anexo') == ANEXO_RCL_RREO
+                  and (i.get('cod_conta'), i.get('coluna')) == CAMPO_RCL_RREO]
+        if len(linhas) != 1:
+            return falha(f'{CAMPO_RCL_RREO[0]} ({CAMPO_RCL_RREO[1]}) aparece {len(linhas)} vezes no {ANEXO_RCL_RREO}.')
+        linha = linhas[0]
+        valores = dict(rcl=valor_api(linha.get('valor'), f'{url} {CAMPO_RCL_RREO[0]} ({CAMPO_RCL_RREO[1]})'),
+                       exercicio=linha.get('exercicio'), periodo=linha.get('periodo'))
+        return resultado('siconfi_rreo_rcl', url, 'consultada',
+                         f"RREO {valores['exercicio']}, {valores['periodo']}º bimestre: RCL dos últimos 12 meses.",
+                         valores, conteudo, checked_at)
+    except DataError as e:
+        return falha(str(e))
+
+
+def coletar_rreo_rcl(cache: Path, exercicio: int, bimestre: int, id_ente: int = MUNICIPIO_PADRAO,
+                     demonstrativo: str = 'RREO Simplificado', esperar: Callable[[float], None] = time.sleep,
+                     relogio: Callable[[], float] = time.monotonic, agora: Callable[[], datetime] = agora_utc,
+                     forcar: bool = False) -> dict:
+    parametros = dict(an_exercicio=exercicio, nr_periodo=bimestre, co_tipo_demonstrativo=demonstrativo,
+                      no_anexo=ANEXO_RCL_RREO, co_esfera='M', id_ente=id_ente)
+    url = url_siconfi('rreo', parametros)
+    obter = obter_por('siconfi_rreo_rcl', url, lambda: buscar_siconfi('rreo', parametros, esperar, relogio)[1],
+                      lambda conteudo, checked_at: ler_rreo_rcl(conteudo, url, checked_at))
+    return coletar(cache, 'siconfi_rreo_rcl', url, obter, agora, forcar)
+
+
+def reais(valor: float) -> str:
+    """R$ no formato brasileiro, para notas que vão para a tela e para o relatório."""
+    return 'R$ ' + f'{valor:,.2f}'.replace(',', '_').replace('.', ',').replace('_', '.')
+
+
+def conferir_rcl(rgf: dict, rreo: dict) -> dict:
+    """acrescenta ao RGF a conferência da RCL pelo RREO, sem mudar o status nem os valores do RGF.
+
+    Assimetria proposital com a conferência da razão (ler_rgf_pessoal): lá os dois números vêm da mesma
+    tabela do mesmo demonstrativo, e divergência quer dizer que a leitura pegou a linha errada, então o
+    dado é descartado. Aqui são duas entregas diferentes, homologadas em datas diferentes; uma pode ter
+    sido retificada e a outra não. O RGF é o demonstrativo do limite de pessoal e continua sendo a
+    fonte; a divergência fica registrada para o usuário decidir.
+    """
+    rcl = rgf['valores']['rcl']
+    if rreo['status'] != 'consultada':
+        conferencia = dict(situacao='nao_feita', rcl_rreo=None, diferenca=None)
+        nota = f"A conferência da RCL pelo RREO não pôde ser feita ({rreo['status']}): {rreo['note']}"
+    else:
+        rcl_rreo = rreo['valores']['rcl']
+        diferenca = round(rcl - rcl_rreo, 2)
+        situacao = 'confere' if abs(diferenca) <= TOLERANCIA_RCL else 'diverge'
+        conferencia = dict(situacao=situacao, rcl_rreo=rcl_rreo, diferenca=diferenca)
+        if situacao == 'confere':
+            nota = 'A RCL confere com a do RREO-Anexo 03 do mesmo período.'
+        else:
+            nota = (f'A RCL do RGF ({reais(rcl)}) diverge da do RREO-Anexo 03 do mesmo período ({reais(rcl_rreo)}), '
+                    f'diferença de {reais(diferenca)}. O valor do RGF é mantido; confira se um dos demonstrativos foi retificado.')
+    return {**rgf, 'valores': {**rgf['valores'], 'conferencia_rreo': conferencia}, 'note': f"{rgf['note']} {nota}"}
+
+
 def coletar_rcl(cache: Path, id_ente: int = MUNICIPIO_PADRAO, esperar: Callable[[float], None] = time.sleep,
                 relogio: Callable[[], float] = time.monotonic, agora: Callable[[], datetime] = agora_utc,
                 forcar: bool = False) -> dict:
@@ -793,6 +874,12 @@ def coletar_rcl(cache: Path, id_ente: int = MUNICIPIO_PADRAO, esperar: Callable[
     v = periodo['valores']
     rgf = coletar_rgf_pessoal(cache, v['exercicio'], v['periodo'], id_ente, v['periodicidade'], v['demonstrativo'],
                               esperar, relogio, agora, forcar)
+    if rgf['status'] == 'consultada':
+        # conferência opcional: o RREO só acrescenta uma nota, nunca muda o status do RGF.
+        rreo = coletar_rreo_rcl(cache, v['exercicio'], BIMESTRE_DO_RGF[(v['periodicidade'], v['periodo'])], id_ente,
+                                'RREO Simplificado' if v['demonstrativo'] == 'RGF Simplificado' else 'RREO',
+                                esperar, relogio, agora, forcar)
+        rgf = conferir_rcl(rgf, rreo)
     escolha = {k: v[k] for k in ('exercicio', 'periodo', 'periodicidade', 'demonstrativo', 'data_status',
                                  'mais_recente_publicado')}
     return {**rgf, 'valores': {**rgf['valores'], 'escolha_periodo': escolha} if rgf['valores'] else {},
