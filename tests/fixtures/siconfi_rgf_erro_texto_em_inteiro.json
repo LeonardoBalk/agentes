@@ -1,0 +1,7 @@
+{
+    "code": "BadRequest",
+    "title": "Bad Request",
+    "message": "Invalid value provided for parameter an_exercicio. The detailed error message: Character a is neither a decimal digit number, decimal point, nor \"e\" notation exponential mark..",
+    "type": "tag:oracle.com,2020:error/BadRequest",
+    "instance": "tag:oracle.com,2020:ecid/Idk_NzQ-9xw8YZlCG6ZkvA"
+}
