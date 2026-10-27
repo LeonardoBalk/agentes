@@ -15,7 +15,7 @@ FIXTURES=ROOT/'tests'/'fixtures'
 URL_RGF='https://apidatalake.tesouro.gov.br/ords/cdwhprd/siconfi/tt/rgf?teste'
 URL_IBGE='https://servicodados.ibge.gov.br/api/v3/agregados/6579/teste'
 SANTA_LEOPOLDINA=3204500
-CONTRATO={'id','title','url','status','checked_at','content_sha256','note','valores'}
+CONTRATO={'id','title','url','status','checked_at','content_sha256','note','valores','desatualizado'}
 
 
 def fixture(nome: str) -> bytes:

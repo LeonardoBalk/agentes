@@ -56,10 +56,14 @@ def resultado(fonte_id: str, url: str | None, status: str, note: str, valores: d
     return dict(id=f['id'], title=f['title'], url=url, status=status,
                 checked_at=checked_at if checked_at is not None else (None if status == 'nao_consultada' else now()),
                 content_sha256=hashlib.sha256(conteudo).hexdigest() if conteudo is not None else None,
-                note=note, valores=valores or {})
+                note=note, valores=valores or {}, desatualizado=False)
 
 
-CHAVES_RESULTADO = {'id', 'title', 'url', 'status', 'checked_at', 'content_sha256', 'note', 'valores'}
+# desatualizado=True só aparece em resultado consultada servido do cache depois de uma atualização que
+# falhou. Um campo e não um quinto status: o dado continua válido para quem lê só o status, e a tela
+# usa o campo para avisar que ele é antigo.
+CHAVES_RESULTADO = {'id', 'title', 'url', 'status', 'checked_at', 'content_sha256', 'note', 'valores',
+                    'desatualizado'}
 
 
 def nao_consultadas() -> list[dict]:
@@ -584,7 +588,25 @@ def coletar(cache: Path, fonte_id: str, url: str, obter: Callable[[str], dict],
         dados[fonte_id] = dict(url=url, ultimo_bom=bom, ultimo_bom_em=bom_em,
                                ultima_tentativa=novo, ultima_tentativa_em=momento.isoformat())
         gravar_cache(cache, dados)
-        return novo
+        if novo['status'] == 'consultada' or bom is None:
+            return novo
+        return valor_velho(bom, novo, momento - instante(bom_em))
+
+
+def descrever_idade(idade: timedelta) -> str:
+    if idade.days >= 1:
+        return f'{idade.days} dia' + ('s' if idade.days > 1 else '')
+    horas = idade.seconds // 3600
+    if horas:
+        return f'{horas} hora' + ('s' if horas > 1 else '')
+    return f'{max(idade.seconds // 60, 1)} min'
+
+
+def valor_velho(bom: dict, falha: dict, idade: timedelta) -> dict:
+    """último valor bom, marcado como desatualizado, com a idade e o motivo da falha na nota."""
+    return {**bom, 'desatualizado': True,
+            'note': f"{bom['note']} Valor coletado há {descrever_idade(idade)}; a atualização falhou "
+                    f"({falha['status']}): {falha['note']}"}
 
 
 def obter_por(fonte_id: str, url: str, baixar_bytes: Callable[[], bytes],
