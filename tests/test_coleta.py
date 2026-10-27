@@ -745,6 +745,11 @@ class ColetaRedeTests(unittest.TestCase):
         self.assertEqual(por_codigo[3201159]['rcl'],93_322_840.40)
         self.assertEqual(por_codigo[3202702]['rcl_per_capita'],round(93_505_906.85/14042,2))
 
+    def test_median_rounds_half_a_cent_up(self):
+        # valores reais de 2025: os dois do meio somam 14.136,99, mediana 7.068,495.
+        self.assertEqual(coleta.centavos(7068.495),7068.50)
+        self.assertEqual(coleta.centavos(6778.3665423876055),6778.37)
+
     def test_study_case_revenue_is_shown_with_a_neutral_notice(self):
         r,_=self.benchmark(pares_sinteticos(),receita_estudo=577_300_000)
         c=r['valores']['comparacao_estudo']

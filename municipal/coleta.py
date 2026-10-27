@@ -12,6 +12,7 @@ import threading
 import time
 import zlib
 from datetime import datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError
@@ -903,6 +904,11 @@ FAIXA_PARES = 1.5        # até 1,5 vez maior ou menor que o município
 OPCOES_RGF_PAR = (('S', 'RGF Simplificado', 2), ('Q', 'RGF', 3))
 
 
+def centavos(valor: float) -> float:
+    """arredonda meio centavo para cima, como no relatório; round() em float arredonda 7068,495 para baixo."""
+    return float(Decimal(repr(valor)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+
+
 def selecionar_pares(municipios: list[dict], codigo_ibge: int) -> list[dict]:
     """até MAXIMO_PARES municípios mais próximos em população, dentro da FAIXA_PARES."""
     alvo = next((m for m in municipios if m['codigo_ibge'] == codigo_ibge), None)
@@ -944,7 +950,7 @@ def coletar_pares(cache: Path, pares: list[dict], exercicio: int, chave: str, es
                                       motivo=f"{r['status']}: {r['note']}"))
                 continue
             rcl = r['valores']['rcl']
-            validos.append(dict(par, rcl=rcl, rcl_per_capita=round(rcl / par['populacao'], 2),
+            validos.append(dict(par, rcl=rcl, rcl_per_capita=centavos(rcl / par['populacao']),
                                 periodicidade=r['valores']['periodicidade'], periodo=r['valores']['periodo']))
         valores = dict(exercicio=exercicio, pares=validos, excluidos=excluidos, total_excluidos=len(excluidos))
         nota = f'{len(validos)} de {len(pares)} pares com RCL de {exercicio}; {len(excluidos)} excluídos sem dado.'
@@ -1002,9 +1008,9 @@ def coletar_benchmark(cache: Path, receita_estudo: float | None = None, id_ente:
         return r
 
     # a parte do município é recalculada a cada chamada, com a RCL e a população mais recentes do cache.
-    valor = round(rcl['valores']['rcl'] / municipio['populacao'], 2)
+    valor = centavos(rcl['valores']['rcl'] / municipio['populacao'])
     por_capita = [p['rcl_per_capita'] for p in r['valores']['pares']]
-    mediana = round(statistics.median(por_capita), 2)
+    mediana = centavos(statistics.median(por_capita))
     ordem = 1 + sum(v > valor for v in por_capita)
     diferenca = round((valor / mediana - 1) * 100, 1)
     valores = dict(r['valores'], municipio=dict(municipio, rcl=rcl['valores']['rcl'], rcl_per_capita=valor),
@@ -1017,7 +1023,7 @@ def coletar_benchmark(cache: Path, receita_estudo: float | None = None, id_ente:
             f"{ordem}º de {len(por_capita) + 1} do maior para o menor valor. {r['note']}")
     if receita_estudo is not None:
         receita = valor_api(receita_estudo, 'receita do estudo de caso')
-        receita_hab = round(receita / municipio['populacao'], 2)
+        receita_hab = centavos(receita / municipio['populacao'])
         aviso = aviso_estudo_de_caso(municipio['nome'], exercicio, receita_hab, valor)
         valores['comparacao_estudo'] = dict(receita_estudo=receita, receita_estudo_per_capita=receita_hab,
                                             rcl_per_capita=valor, razao=round(receita_hab / valor, 2), aviso=aviso)
