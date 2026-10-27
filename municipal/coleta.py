@@ -7,6 +7,7 @@ import http.client
 import json
 import math
 import re
+import statistics
 import threading
 import time
 import zlib
@@ -28,6 +29,7 @@ COLETAS = [
     dict(id='ibge_populacao_municipios', title='IBGE - População residente estimada dos municípios (agregado 6579)'),
     dict(id='siconfi_extrato', title='SICONFI - Extrato de entregas: último RGF publicado pela Prefeitura'),
     dict(id='siconfi_rreo_rcl', title='SICONFI - RREO, Anexo 03: RCL dos últimos 12 meses (conferência)'),
+    dict(id='benchmark_rcl_per_capita', title='Benchmark - RCL por habitante entre municípios de porte semelhante'),
 ]
 
 # sem_dados é o único status novo: o SICONFI responde HTTP 200 com items vazio quando não há
@@ -510,7 +512,7 @@ def buscar_siconfi(recurso: str, parametros: dict, esperar: Callable[[float], No
 # pequenas; 1 dia faz a escolha do período acompanhar uma publicação nova no dia seguinte.
 VALIDADE = dict(siconfi_rgf_pessoal=timedelta(days=7), ibge_populacao=timedelta(days=30),
                 ibge_populacao_municipios=timedelta(days=30), siconfi_extrato=timedelta(days=1),
-                siconfi_rreo_rcl=timedelta(days=7))
+                siconfi_rreo_rcl=timedelta(days=7), benchmark_rcl_per_capita=timedelta(days=7))
 # depois de uma falha, não tentar de novo antes disso. Cada falha completa custa até ~80 s (3 tentativas
 # com timeout de 20 s mais esperas de 5 e 15 s): 5 min evita que dois cliques seguidos em "atualizar"
 # paguem isso duas vezes, e é curto o bastante para a coleta voltar sozinha logo depois que a rede
@@ -884,3 +886,140 @@ def coletar_rcl(cache: Path, id_ente: int = MUNICIPIO_PADRAO, esperar: Callable[
                                  'mais_recente_publicado')}
     return {**rgf, 'valores': {**rgf['valores'], 'escolha_periodo': escolha} if rgf['valores'] else {},
             'note': f"{rgf['note']} Período escolhido pelo extrato de entregas: {periodo['note']}"}
+
+
+
+# ---------------------------------------------------------------- benchmark per capita
+
+# pares: os municípios da UF mais próximos em população, medida pela razão (13.000 está tão perto de
+# 13.813 quanto 14.677). Faixa percentual fixa daria 2 pares numa UF e 40 em outra; os N mais próximos
+# dão sempre o mesmo tamanho de amostra. A faixa máxima só impede que uma UF pequena empurre para a
+# lista municípios com o dobro ou a metade do porte.
+MAXIMO_PARES = 10        # cada par custa 1 ou 2 requisições ao SICONFI (1,1 s cada); 10 fica perto de 11-22 s, em cache por 7 dias
+MINIMO_PARES = 5         # com menos de 5 valores a mediana é dominada por um único município
+FAIXA_PARES = 1.5        # até 1,5 vez maior ou menor que o município
+# o SICONFI aceita um id_ente por consulta (ETAPA4_NEGOCIO.md): uma requisição por par. Cada par é
+# tentado no simplificado semestral e, se não houver, no RGF comum quadrimestral.
+OPCOES_RGF_PAR = (('S', 'RGF Simplificado', 2), ('Q', 'RGF', 3))
+
+
+def selecionar_pares(municipios: list[dict], codigo_ibge: int) -> list[dict]:
+    """até MAXIMO_PARES municípios mais próximos em população, dentro da FAIXA_PARES."""
+    alvo = next((m for m in municipios if m['codigo_ibge'] == codigo_ibge), None)
+    if alvo is None:
+        return []
+    distancia = lambda m: abs(math.log(m['populacao'] / alvo['populacao']))
+    candidatos = [m for m in municipios if m['codigo_ibge'] != codigo_ibge and distancia(m) <= math.log(FAIXA_PARES)]
+    return sorted(candidatos, key=lambda m: (distancia(m), m['codigo_ibge']))[:MAXIMO_PARES]
+
+
+def rgf_de_par(codigo_ibge: int, exercicio: int, esperar: Callable[[float], None],
+               relogio: Callable[[], float]) -> dict:
+    """RGF-Anexo 01 de um par, sem cache próprio: o benchmark inteiro é que fica em cache."""
+    r = None
+    for periodicidade, demonstrativo, periodo in OPCOES_RGF_PAR:
+        parametros = dict(an_exercicio=exercicio, in_periodicidade=periodicidade, nr_periodo=periodo,
+                          co_tipo_demonstrativo=demonstrativo, no_anexo=ANEXO_PESSOAL, co_esfera='M',
+                          co_poder='E', id_ente=codigo_ibge)
+        url = url_siconfi('rgf', parametros)
+        try:
+            r = ler_rgf_pessoal(buscar_siconfi('rgf', parametros, esperar, relogio)[1], url)
+        except FalhaColeta as e:
+            # falha de rede não melhora trocando o tipo de demonstrativo.
+            return resultado('siconfi_rgf_pessoal', url, 'indisponivel', str(e))
+        if r['status'] != 'sem_dados':
+            return r
+    return r
+
+
+def coletar_pares(cache: Path, pares: list[dict], exercicio: int, chave: str, esperar: Callable[[float], None],
+                  relogio: Callable[[], float], agora: Callable[[], datetime], forcar: bool) -> dict:
+    """RCL por habitante de cada par; par sem dado sai da lista com registro."""
+    def obter(checked_at: str) -> dict:
+        validos, excluidos = [], []
+        for par in pares:
+            r = rgf_de_par(par['codigo_ibge'], exercicio, esperar, relogio)
+            if r['status'] != 'consultada':
+                excluidos.append(dict(codigo_ibge=par['codigo_ibge'], nome=par['nome'],
+                                      motivo=f"{r['status']}: {r['note']}"))
+                continue
+            rcl = r['valores']['rcl']
+            validos.append(dict(par, rcl=rcl, rcl_per_capita=round(rcl / par['populacao'], 2),
+                                periodicidade=r['valores']['periodicidade'], periodo=r['valores']['periodo']))
+        valores = dict(exercicio=exercicio, pares=validos, excluidos=excluidos, total_excluidos=len(excluidos))
+        nota = f'{len(validos)} de {len(pares)} pares com RCL de {exercicio}; {len(excluidos)} excluídos sem dado.'
+        if len(validos) < MINIMO_PARES:
+            return resultado('benchmark_rcl_per_capita', None, 'sem_dados',
+                             f'{nota} São necessários pelo menos {MINIMO_PARES}; {len(excluidos)} falharam.',
+                             dict(valores, pares=[]), checked_at=checked_at)
+        return resultado('benchmark_rcl_per_capita', None, 'consultada', nota, valores, checked_at=checked_at)
+
+    return coletar(cache, 'benchmark_rcl_per_capita', chave, obter, agora, forcar)
+
+
+def aviso_estudo_de_caso(nome: str, exercicio: int, receita_estudo_hab: float, rcl_hab: float) -> str:
+    """aviso neutro: os números do estudo não são os do município real. Vai para a tela e o relatório."""
+    vezes = f'{receita_estudo_hab / rcl_hab:.1f}'.replace('.', ',')
+    return ('Os valores do estudo de caso não correspondem aos valores publicados pelo município real. '
+            f'A receita arrecadada da planilha equivale a {reais(receita_estudo_hab)} por habitante; a Receita '
+            f'Corrente Líquida publicada por {nome} no RGF de {exercicio} equivale a {reais(rcl_hab)} por '
+            f'habitante, cerca de {vezes} vezes menor. Os dois números também não medem exatamente a mesma '
+            'coisa, porque a RCL exclui deduções previstas na Lei de Responsabilidade Fiscal. Por isso, este '
+            'benchmark serve como referência de ordem de grandeza, não como comparação direta com a planilha.')
+
+
+def coletar_benchmark(cache: Path, receita_estudo: float | None = None, id_ente: int = MUNICIPIO_PADRAO,
+                      uf: int = UF_PADRAO, esperar: Callable[[float], None] = time.sleep,
+                      relogio: Callable[[], float] = time.monotonic, agora: Callable[[], datetime] = agora_utc,
+                      forcar: bool = False) -> dict:
+    """RCL por habitante do município ao lado da mediana dos pares de porte semelhante na UF.
+
+    receita_estudo é a receita arrecadada da planilha (dataset['metrics']['revenue']); quando vem, o
+    resultado traz o aviso de que o estudo de caso não usa os valores publicados do município.
+    """
+    def sem(status: str, nota: str, checked_at=None) -> dict:
+        return resultado('benchmark_rcl_per_capita', None, status if status != 'consultada' else 'sem_dados',
+                         nota, checked_at=checked_at)
+
+    rcl = coletar_rcl(cache, id_ente, esperar, relogio, agora, forcar)
+    if rcl['status'] != 'consultada':
+        return sem(rcl['status'], f"Sem a RCL do município. {rcl['note']}", rcl['checked_at'])
+    exercicio = rcl['valores']['exercicio']
+    lista = coletar_populacao_municipios(cache, exercicio, uf, esperar, agora, forcar)
+    if lista['status'] != 'consultada':
+        return sem(lista['status'], f"Sem a população dos municípios em {exercicio}. {lista['note']}", lista['checked_at'])
+    municipio = next((m for m in lista['valores']['municipios'] if m['codigo_ibge'] == id_ente), None)
+    if municipio is None:
+        return sem('sem_dados', f'Município {id_ente} sem população de {exercicio} na lista do IBGE.')
+    pares = selecionar_pares(lista['valores']['municipios'], id_ente)
+    if len(pares) < MINIMO_PARES:
+        return sem('sem_dados', f'Só {len(pares)} municípios da UF têm porte semelhante; são necessários {MINIMO_PARES}.')
+
+    chave = (f"benchmark rcl_per_capita uf={uf} ente={id_ente} exercicio={exercicio} "
+             f"pares={','.join(str(p['codigo_ibge']) for p in pares)}")
+    r = coletar_pares(cache, pares, exercicio, chave, esperar, relogio, agora, forcar)
+    if r['status'] != 'consultada':
+        return r
+
+    # a parte do município é recalculada a cada chamada, com a RCL e a população mais recentes do cache.
+    valor = round(rcl['valores']['rcl'] / municipio['populacao'], 2)
+    por_capita = [p['rcl_per_capita'] for p in r['valores']['pares']]
+    mediana = round(statistics.median(por_capita), 2)
+    ordem = 1 + sum(v > valor for v in por_capita)
+    diferenca = round((valor / mediana - 1) * 100, 1)
+    valores = dict(r['valores'], municipio=dict(municipio, rcl=rcl['valores']['rcl'], rcl_per_capita=valor),
+                   mediana_pares=mediana,
+                   posicao=dict(ordem=ordem, total=len(por_capita) + 1, diferenca_mediana_pct=diferenca))
+    pct = f'{abs(diferenca):.1f}'.replace('.', ',')
+    nota = (f"RCL por habitante de {municipio['nome']} em {exercicio}: {reais(valor)}. Mediana de "
+            f"{len(por_capita)} municípios da UF com população semelhante: {reais(mediana)}. O município está "
+            f"{pct}% {'acima' if diferenca >= 0 else 'abaixo'} da mediana, "
+            f"{ordem}º de {len(por_capita) + 1} do maior para o menor valor. {r['note']}")
+    if receita_estudo is not None:
+        receita = valor_api(receita_estudo, 'receita do estudo de caso')
+        receita_hab = round(receita / municipio['populacao'], 2)
+        aviso = aviso_estudo_de_caso(municipio['nome'], exercicio, receita_hab, valor)
+        valores['comparacao_estudo'] = dict(receita_estudo=receita, receita_estudo_per_capita=receita_hab,
+                                            rcl_per_capita=valor, razao=round(receita_hab / valor, 2), aviso=aviso)
+        nota += ' Aviso: ' + aviso
+    return {**r, 'valores': valores, 'note': nota}

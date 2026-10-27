@@ -277,11 +277,31 @@ def extrato(ano: int,status=None) -> bytes:
     return json.dumps(payload).encode('utf-8')
 
 
-def siconfi(extratos: dict,rgf=None,rreo=None,pares=None):
+# os 10 municípios do ES mais próximos de Santa Leopoldina em população (2025), em ordem de distância.
+PARES_ES=[(3201159,13718),(3202702,14042),(3201001,14054),(3203809,14185),(3205176,14267),
+          (3203130,14295),(3200300,14376),(3203304,13131),(3203353,13087),(3202652,14647)]
+
+
+def rgf_com_rcl(rcl: float) -> bytes:
+    payload=json.loads(fixture('siconfi_rgf_2025_s2.json'))
+    for i in payload['items']:
+        if i['cod_conta']=='ReceitaCorrenteLiquidaLimiteLegal':
+            i['valor']=rcl
+    return json.dumps(payload).encode('utf-8')
+
+
+def pares_sinteticos() -> dict:
+    """RCL por habitante de 5.000 a 9.500, de 500 em 500, na ordem de PARES_ES: mediana 7.250."""
+    return {codigo:rgf_com_rcl(populacao*(5000+500*i)) for i,(codigo,populacao) in enumerate(PARES_ES)}
+
+
+def siconfi(extratos: dict,rgf=None,rreo=None,pares=None,ibge=None):
     """urlopen falso que responde pelo recurso e pelos parâmetros da URL."""
     def chamada(req,timeout):
         url=req.full_url
-        if '/extrato_entregas?' in url:
+        if url.startswith('https://servicodados.ibge.gov.br/'):
+            corpo=ibge
+        elif '/extrato_entregas?' in url:
             corpo=extratos[int(url.split('an_referencia=')[1][:4])]
         elif '/rreo?' in url:
             corpo=rreo
@@ -654,6 +674,95 @@ class ColetaRedeTests(unittest.TestCase):
         self.assertEqual(rede.call_count,3)
         self.assertEqual(r['status'],'sem_dados')
         self.assertEqual(r['id'],'siconfi_rgf_pessoal')
+
+    def benchmark(self,pares,receita_estudo=None):
+        extratos={a:extrato(a) for a in (2024,2025,2026)}
+        falso=siconfi(extratos,rgf=fixture('siconfi_rgf_2025_s2.json'),rreo=fixture('siconfi_rreo_2025_b6_anexo03.json'),
+                      pares=pares,ibge=fixture('ibge_populacao_es.json'))
+        with patch('municipal.coleta.urlopen',side_effect=falso) as rede:
+            r=coleta.coletar_benchmark(self.cache,receita_estudo,esperar=self.relogio.esperar,relogio=self.relogio,
+                                       agora=lambda:self.dia)
+        return r,rede
+
+    def test_peers_are_the_nearest_by_population_within_the_band(self):
+        municipios=json.loads(fixture('ibge_populacao_es.json'))[0]['resultados'][0]['series']
+        municipios=[dict(codigo_ibge=int(s['localidade']['id']),nome=s['localidade']['nome'],populacao=int(s['serie']['2025']))
+                    for s in municipios]
+        self.assertEqual([p['codigo_ibge'] for p in coleta.selecionar_pares(municipios,SANTA_LEOPOLDINA)],[c for c,_ in PARES_ES])
+        poucos=[dict(codigo_ibge=1,nome='a',populacao=10_000),dict(codigo_ibge=2,nome='b',populacao=14_000),
+                dict(codigo_ibge=3,nome='c',populacao=16_000),dict(codigo_ibge=4,nome='d',populacao=6_000)]
+        self.assertEqual([p['codigo_ibge'] for p in coleta.selecionar_pares(poucos,1)],[2])
+
+    def test_benchmark_median_and_position_checked_by_hand(self):
+        r,rede=self.benchmark(pares_sinteticos())
+        self.assertEqual(r['status'],'consultada')
+        v=r['valores']
+        self.assertEqual(v['municipio']['rcl_per_capita'],6778.37)          # 93.629.577,05 / 13.813
+        self.assertEqual(v['mediana_pares'],7250.00)                         # (7.000 + 7.500) / 2
+        self.assertEqual(v['posicao'],dict(ordem=7,total=11,diferenca_mediana_pct=-6.5))  # 6 pares acima de 6.778,37
+        self.assertEqual([p['codigo_ibge'] for p in v['pares']],[c for c,_ in PARES_ES])
+        self.assertEqual([p['rcl_per_capita'] for p in v['pares']],[5000.0+500*i for i in range(10)])
+        self.assertEqual(v['total_excluidos'],0)
+        self.assertIn('6,5% abaixo da mediana',r['note'])
+        self.assertIn('R$ 7.250,00',r['note'])
+        pedidos_rgf=[c for c in rede.call_args_list if '/rgf?' in c.args[0].full_url]
+        self.assertEqual(len(pedidos_rgf),11)
+
+    def test_benchmark_survives_two_failing_peers_and_records_them(self):
+        pares=pares_sinteticos()
+        pares[3203809]=fixture('siconfi_rgf_erro_sem_id_ente.json')   # Muqui: sem dado nos dois tipos de RGF
+        pares[3202652]=erro_http(500)                                   # Irupi: servidor fora
+        r,_=self.benchmark(pares)
+        self.assertEqual(r['status'],'consultada')
+        v=r['valores']
+        self.assertEqual(len(v['pares']),8)
+        self.assertEqual({e['codigo_ibge'] for e in v['excluidos']},{3203809,3202652})
+        self.assertEqual(v['total_excluidos'],2)
+        self.assertEqual(v['mediana_pares'],7250.00)
+        self.assertEqual(v['posicao']['ordem'],6)
+        self.assertIn('8 de 10 pares',r['note'])
+
+    def test_benchmark_with_too_many_failing_peers_is_no_data(self):
+        pares=pares_sinteticos()
+        for codigo,_ in PARES_ES[:6]:
+            pares[codigo]=fixture('siconfi_rgf_erro_sem_id_ente.json')
+        r,_=self.benchmark(pares)
+        self.assertEqual(r['status'],'sem_dados')
+        self.assertIn('6 falharam',r['note'])
+        self.assertEqual(r['valores']['pares'],[])
+
+    def test_peer_without_simplified_rgf_falls_back_to_the_quadrimestral_one(self):
+        pares=pares_sinteticos()
+        def brejetuba(req,timeout):
+            if 'in_periodicidade=Q' in req.full_url:
+                return Resposta(fixture('siconfi_rgf_2025_q3_anexo01_3201159.json'))
+            return Resposta(fixture('siconfi_rgf_2025_s2_anexo01_3201159_vazio.json'))
+        pares[3201159]=brejetuba
+        pares[3202702]=fixture('siconfi_rgf_2025_s2_anexo01_3202702.json')
+        r,_=self.benchmark(pares)
+        por_codigo={p['codigo_ibge']:p for p in r['valores']['pares']}
+        self.assertEqual((por_codigo[3201159]['periodicidade'],por_codigo[3201159]['periodo']),('Q',3))
+        self.assertEqual(por_codigo[3201159]['rcl'],93_322_840.40)
+        self.assertEqual(por_codigo[3202702]['rcl_per_capita'],round(93_505_906.85/14042,2))
+
+    def test_study_case_revenue_is_shown_with_a_neutral_notice(self):
+        r,_=self.benchmark(pares_sinteticos(),receita_estudo=577_300_000)
+        c=r['valores']['comparacao_estudo']
+        self.assertEqual(c['receita_estudo_per_capita'],41793.96)
+        self.assertEqual(c['razao'],6.17)
+        for trecho in ('não correspondem aos valores publicados pelo município real',
+                       'referência de ordem de grandeza, não como comparação direta','cerca de 6,2 vezes menor'):
+            self.assertIn(trecho,c['aviso'])
+            self.assertIn(trecho,r['note'])
+        for acusacao in ('erro','errad','incorret','falso'):
+            self.assertNotIn(acusacao,c['aviso'].lower())
+
+    def test_benchmark_within_validity_does_not_touch_the_network(self):
+        primeiro,_=self.benchmark(pares_sinteticos())
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('não deveria acessar a rede')) as rede:
+            segundo=coleta.coletar_benchmark(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
+        rede.assert_not_called()
+        self.assertEqual(segundo['valores'],primeiro['valores'])
 
     def test_cache_write_is_atomic_and_leaves_no_temporary_file(self):
         with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
