@@ -7,7 +7,8 @@ import http.client
 import json
 import math
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -310,9 +311,14 @@ def baixar(url: str) -> tuple[int, bytes]:
             with urlopen(Request(url, headers=CABECALHOS), timeout=TIMEOUT) as resposta:
                 status, conteudo = resposta.status, resposta.read(TETO_BYTES + 1)
         except HTTPError as e:
-            # urllib levanta exceção em 4xx/5xx; o corpo e o código continuam valendo para quem classifica.
-            with e:
-                status, conteudo = e.code, e.read(TETO_BYTES + 1)
+            # urllib levanta exceção em 4xx/5xx; o código decide a repetição, o corpo é só complemento.
+            status = e.code
+            try:
+                conteudo = e.read(TETO_BYTES + 1)
+            except (OSError, ValueError, http.client.HTTPException):
+                conteudo = b''
+            finally:
+                e.close()
     except (OSError, http.client.HTTPException) as e:
         # OSError cobre timeout, conexão recusada e DNS; URLError é subclasse e guarda a causa em reason.
         causa = e.reason if isinstance(getattr(e, 'reason', None), BaseException) else e
@@ -320,3 +326,46 @@ def baixar(url: str) -> tuple[int, bytes]:
     if len(conteudo) > TETO_BYTES:
         raise FalhaRede(f'resposta maior que {TETO_BYTES // 1_000_000} MB', passageira=False)
     return status, conteudo
+
+
+# mesmo padrão e mesmos valores de agente.py (TENTATIVAS, ESPERAS), mas sem reaproveitar o código: lá a
+# classificação lê o texto do erro do provedor de LLM e a espera não é injetável.
+TENTATIVAS = 3
+ESPERAS = (5, 15)
+
+
+class FalhaColeta(Exception):
+    """a busca desistiu; a nota já está pronta para o resultado."""
+    def __init__(self, nota: str, tentativas: int):
+        super().__init__(nota)
+        self.tentativas = tentativas
+
+
+def classificar_status(status: int) -> tuple[str, bool]:
+    """mensagem e se vale tentar de novo. 5xx e 429 passam; o resto de 4xx não se resolve sozinho."""
+    if status == 429:
+        return 'HTTP 429 (limite de requisições do servidor)', True
+    if status >= 500:
+        return f'HTTP {status} (erro no servidor)', True
+    return f'HTTP {status} (requisição recusada)', False
+
+
+def buscar(url: str, esperar: Callable[[float], None] = time.sleep,
+           antes: Callable[[], None] | None = None) -> bytes:
+    """bytes de uma resposta 2xx, repetindo só falha passageira. antes() roda antes de cada tentativa."""
+    for tentativa in range(1, TENTATIVAS + 1):
+        if antes:
+            antes()
+        try:
+            status, conteudo = baixar(url)
+            if 200 <= status < 300:
+                return conteudo
+            motivo, passageira = classificar_status(status)
+        except FalhaRede as e:
+            motivo, passageira = str(e), e.passageira
+        if not passageira or tentativa == TENTATIVAS:
+            # o 500 do IBGE para município inexistente é permanente, mas só se sabe depois das tentativas.
+            plural = 'tentativa' if tentativa == 1 else 'tentativas'
+            raise FalhaColeta(f'Consulta não concluída após {tentativa} {plural}: {motivo}.', tentativa)
+        esperar(ESPERAS[tentativa - 1])
+    raise AssertionError('inalcançável')
