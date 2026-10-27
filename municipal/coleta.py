@@ -26,6 +26,7 @@ COLETAS = [
     dict(id='siconfi_rgf_pessoal', title='SICONFI - RGF Simplificado, Anexo 01: despesa com pessoal e RCL'),
     dict(id='ibge_populacao', title='IBGE - População residente estimada do município (agregado 6579)'),
     dict(id='ibge_populacao_municipios', title='IBGE - População residente estimada dos municípios (agregado 6579)'),
+    dict(id='siconfi_extrato', title='SICONFI - Extrato de entregas: último RGF publicado pela Prefeitura'),
 ]
 
 # sem_dados é o único status novo: o SICONFI responde HTTP 200 com items vazio quando não há
@@ -504,14 +505,16 @@ def buscar_siconfi(recurso: str, parametros: dict, esperar: Callable[[float], No
 # o RGF é semestral e o publicado só muda por retificação: uma semana pega uma retificação sem
 # repetir a consulta a cada análise. A estimativa do IBGE sai uma vez por ano (a de 2025 foi
 # atualizada em 28/08/2026, segundo /agregados/6579/periodos); 30 dias basta.
+# o extrato é o que mais muda: cada entrega ou retificação nova aparece nele. São 3 consultas
+# pequenas; 1 dia faz a escolha do período acompanhar uma publicação nova no dia seguinte.
 VALIDADE = dict(siconfi_rgf_pessoal=timedelta(days=7), ibge_populacao=timedelta(days=30),
-                ibge_populacao_municipios=timedelta(days=30))
+                ibge_populacao_municipios=timedelta(days=30), siconfi_extrato=timedelta(days=1))
 # depois de uma falha, não tentar de novo antes disso. Cada falha completa custa até ~80 s (3 tentativas
 # com timeout de 20 s mais esperas de 5 e 15 s): 5 min evita que dois cliques seguidos em "atualizar"
 # paguem isso duas vezes, e é curto o bastante para a coleta voltar sozinha logo depois que a rede
 # voltar. Para tentar na hora, o botão de atualizar passa forcar=True.
 RECUO = timedelta(minutes=5)
-CHAVES_ENTRADA = {'url', 'ultimo_bom', 'ultimo_bom_em', 'ultima_tentativa', 'ultima_tentativa_em'}
+CHAVES_ENTRADA = {'chave', 'ultimo_bom', 'ultimo_bom_em', 'ultima_tentativa', 'ultima_tentativa_em'}
 MUNICIPIO_PADRAO = 3204500   # Santa Leopoldina, confirmado na API de localidades do IBGE (ETAPA1_APIS.md)
 UF_PADRAO = 32               # Espírito Santo
 
@@ -532,7 +535,7 @@ def instante(texto: Any) -> datetime:
 
 
 def entrada_valida(fonte_id: str, entrada: Any) -> bool:
-    if not isinstance(entrada, dict) or set(entrada) != CHAVES_ENTRADA or not isinstance(entrada['url'], str):
+    if not isinstance(entrada, dict) or set(entrada) != CHAVES_ENTRADA or not isinstance(entrada['chave'], str):
         return False
     for chave in ('ultimo_bom', 'ultima_tentativa'):
         r = entrada[chave]
@@ -573,10 +576,11 @@ def gravar_cache(cache: Path, dados: dict) -> None:
     temp.replace(cache)
 
 
-def coletar(cache: Path, fonte_id: str, url: str, obter: Callable[[str], dict],
+def coletar(cache: Path, fonte_id: str, chave: str, obter: Callable[[str], dict],
             agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
     """devolve o valor do cache se ainda vale; senão consulta com obter(checked_at) e grava.
 
+    chave identifica a consulta: a URL, quando há uma só, ou a composição das consultas.
     Logo depois de uma falha (RECUO), não consulta: devolve o último valor bom como desatualizado,
     ou a própria falha. forcar=True ignora o recuo, para o botão de atualizar manual; ele não
     ignora a validade, porque valor dentro da validade não precisa de rede.
@@ -584,7 +588,7 @@ def coletar(cache: Path, fonte_id: str, url: str, obter: Callable[[str], dict],
     with TRAVA_COLETA:
         dados = ler_cache(cache)
         entrada = dados.get(fonte_id)
-        if entrada and entrada['url'] != url:
+        if entrada and entrada['chave'] != chave:
             # outra consulta (outro exercício ou município): o valor guardado não responde a esta.
             entrada = None
         momento = agora()
@@ -605,7 +609,7 @@ def coletar(cache: Path, fonte_id: str, url: str, obter: Callable[[str], dict],
         novo = obter(momento.isoformat())
         if novo['status'] == 'consultada':
             bom, bom_em = novo, momento.isoformat()
-        dados[fonte_id] = dict(url=url, ultimo_bom=bom, ultimo_bom_em=bom_em,
+        dados[fonte_id] = dict(chave=chave, ultimo_bom=bom, ultimo_bom_em=bom_em,
                                ultima_tentativa=novo, ultima_tentativa_em=momento.isoformat())
         gravar_cache(cache, dados)
         if novo['status'] == 'consultada' or bom is None:
@@ -677,3 +681,119 @@ def coletar_populacao_municipios(cache: Path, ano: int, uf: int = UF_PADRAO,
     obter = obter_por('ibge_populacao_municipios', url, lambda: buscar(url, esperar),
                       lambda conteudo, checked_at: ler_populacao_municipios(conteudo, url, ano, checked_at))
     return coletar(cache, 'ibge_populacao_municipios', url, obter, agora, forcar)
+
+
+
+# ---------------------------------------------------------------- escolha do período
+
+# nomes de entregável observados nos extratos reais: Santa Leopoldina entrega o simplificado
+# semestral; Brejetuba, o RGF comum quadrimestral (ETAPA4_NEGOCIO.md).
+ENTREGAVEIS_RGF = {'Relatório de Gestão Fiscal Simplificado': 'RGF Simplificado',
+                   'Relatório de Gestão Fiscal': 'RGF'}
+ULTIMO_PERIODO = dict(S=2, Q=3)
+# só homologado (HO), como pedido. A spec também tem RE (retificado): um período retificado continua
+# publicado, mas fica de fora até essa regra ser revista.
+STATUS_ENTREGUE = ('HO',)
+# o exercício corrente costuma estar incompleto: consulta ele e os dois anteriores.
+EXERCICIOS_ATRAS = 2
+
+
+def itens_extrato(conteudo: bytes, url: str) -> list:
+    payload = ler_json(conteudo, url)
+    if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+        raise DataError(f'{url}: resposta sem a lista de itens do extrato.')
+    if payload.get('hasMore') is not False:
+        raise DataError(f'{url}: extrato truncado ou sem o indicador hasMore.')
+    return [i for i in payload['items'] if isinstance(i, dict)]
+
+
+def entregas_rgf(itens: list, id_ente: int) -> list[dict]:
+    """RGFs homologados do Poder Executivo; o extrato não tem campo de poder, só o nome da instituição."""
+    entregas = []
+    for i in itens:
+        exercicio, periodo, periodicidade = i.get('exercicio'), i.get('periodo'), i.get('periodicidade')
+        if (i.get('entregavel') in ENTREGAVEIS_RGF and i.get('status_relatorio') in STATUS_ENTREGUE
+                and i.get('cod_ibge') == id_ente and str(i.get('instituicao', '')).startswith('Prefeitura')
+                and periodicidade in ULTIMO_PERIODO and not isinstance(exercicio, bool) and isinstance(exercicio, int)
+                and not isinstance(periodo, bool) and isinstance(periodo, int)
+                and 1 <= periodo <= ULTIMO_PERIODO[periodicidade]):
+            entregas.append(dict(exercicio=exercicio, periodo=periodo, periodicidade=periodicidade,
+                                 demonstrativo=ENTREGAVEIS_RGF[i['entregavel']], data_status=i.get('data_status')))
+    return entregas
+
+
+def nome_periodo(periodo: int, periodicidade: str) -> str:
+    return f'{periodo}º ' + ('semestre' if periodicidade == 'S' else 'quadrimestre')
+
+
+def escolher_periodo(entregas: list[dict]) -> tuple[dict | None, dict | None]:
+    """(último exercício fechado, período mais recente publicado).
+
+    Exercício fechado = o último período do ano homologado. A RCL dele cobre o ano civil inteiro, o
+    que permite comparar com os pares e com a planilha anual; um período parcial mais recente fica
+    registrado para a tela, mas não é usado no cálculo.
+    """
+    if not entregas:
+        return None, None
+    ordem = lambda e: (e['exercicio'], e['periodo'] / ULTIMO_PERIODO[e['periodicidade']], e['data_status'] or '')
+    fechados = [e for e in entregas if e['periodo'] == ULTIMO_PERIODO[e['periodicidade']]]
+    return (max(fechados, key=ordem) if fechados else None), max(entregas, key=ordem)
+
+
+def coletar_periodo_rgf(cache: Path, id_ente: int = MUNICIPIO_PADRAO, ano: int | None = None,
+                        esperar: Callable[[float], None] = time.sleep, relogio: Callable[[], float] = time.monotonic,
+                        agora: Callable[[], datetime] = agora_utc, forcar: bool = False) -> dict:
+    """último RGF de exercício fechado e homologado da Prefeitura, pelo /extrato_entregas."""
+    ano = ano if ano is not None else agora().year
+    anos = list(range(ano, ano - EXERCICIOS_ATRAS - 1, -1))
+    urls = {a: url_siconfi('extrato_entregas', dict(id_ente=id_ente, an_referencia=a)) for a in anos}
+
+    def obter(checked_at: str) -> dict:
+        itens, falhas, corpos = [], [], []
+        for a in anos:
+            try:
+                conteudo = buscar_siconfi('extrato_entregas', dict(id_ente=id_ente, an_referencia=a), esperar, relogio)[1]
+                itens += itens_extrato(conteudo, urls[a])
+                corpos.append(conteudo)
+            except (FalhaColeta, DataError) as e:
+                falhas.append(f'{a}: {e}')
+        # sha256 da concatenação das respostas, na ordem dos exercícios consultados.
+        conteudo = b''.join(corpos) if corpos else None
+        if len(falhas) == len(anos):
+            return resultado('siconfi_extrato', urls[ano], 'indisponivel',
+                             'Nenhum extrato de entregas pôde ser lido. ' + ' '.join(falhas), checked_at=checked_at)
+        escolhido, recente = escolher_periodo(entregas_rgf(itens, id_ente))
+        aviso = f" Exercícios sem resposta: {' '.join(falhas)}" if falhas else ''
+        if escolhido is None:
+            return resultado('siconfi_extrato', urls[ano], 'sem_dados',
+                             f'Nenhum RGF de exercício fechado homologado pela Prefeitura em {anos[-1]}–{anos[0]}.' + aviso,
+                             conteudo=conteudo, checked_at=checked_at)
+        nota = (f"Último RGF de exercício fechado homologado pela Prefeitura: {escolhido['exercicio']}, "
+                f"{nome_periodo(escolhido['periodo'], escolhido['periodicidade'])} ({escolhido['demonstrativo']}), "
+                f"homologado em {(escolhido['data_status'] or '')[:10]}.")
+        if recente != escolhido:
+            nota += (f" Há período mais recente publicado ({recente['exercicio']}, "
+                     f"{nome_periodo(recente['periodo'], recente['periodicidade'])}), ainda sem o ano fechado; "
+                     'ele não é usado para manter a comparação com os pares e com a planilha anual.')
+        valores = dict(escolhido, mais_recente_publicado=recente, exercicios_consultados=anos)
+        return resultado('siconfi_extrato', urls[ano], 'consultada', nota + aviso, valores, conteudo, checked_at)
+
+    return coletar(cache, 'siconfi_extrato', ' '.join(urls[a] for a in anos), obter, agora, forcar)
+
+
+def coletar_rcl(cache: Path, id_ente: int = MUNICIPIO_PADRAO, esperar: Callable[[float], None] = time.sleep,
+                relogio: Callable[[], float] = time.monotonic, agora: Callable[[], datetime] = agora_utc,
+                forcar: bool = False) -> dict:
+    """RGF-Anexo 01 do último exercício fechado publicado, escolhido pelo extrato de entregas."""
+    periodo = coletar_periodo_rgf(cache, id_ente, None, esperar, relogio, agora, forcar)
+    if periodo['status'] != 'consultada':
+        return resultado('siconfi_rgf_pessoal', None, periodo['status'],
+                         f"Período do RGF não determinado pelo extrato de entregas. {periodo['note']}",
+                         checked_at=periodo['checked_at'])
+    v = periodo['valores']
+    rgf = coletar_rgf_pessoal(cache, v['exercicio'], v['periodo'], id_ente, v['periodicidade'], v['demonstrativo'],
+                              esperar, relogio, agora, forcar)
+    escolha = {k: v[k] for k in ('exercicio', 'periodo', 'periodicidade', 'demonstrativo', 'data_status',
+                                 'mais_recente_publicado')}
+    return {**rgf, 'valores': {**rgf['valores'], 'escolha_periodo': escolha} if rgf['valores'] else {},
+            'note': f"{rgf['note']} Período escolhido pelo extrato de entregas: {periodo['note']}"}

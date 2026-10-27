@@ -269,6 +269,33 @@ def responder(*respostas):
     return chamada
 
 
+def extrato(ano: int,status=None) -> bytes:
+    payload=json.loads(fixture(f'siconfi_extrato_entregas_{ano}.json'))
+    if status:
+        for i in payload['items']:
+            i['status_relatorio']=status
+    return json.dumps(payload).encode('utf-8')
+
+
+def siconfi(extratos: dict,rgf=None,rreo=None,pares=None):
+    """urlopen falso que responde pelo recurso e pelos parâmetros da URL."""
+    def chamada(req,timeout):
+        url=req.full_url
+        if '/extrato_entregas?' in url:
+            corpo=extratos[int(url.split('an_referencia=')[1][:4])]
+        elif '/rreo?' in url:
+            corpo=rreo
+        else:
+            ente=int(url.split('id_ente=')[1].split('&')[0])
+            corpo=rgf if ente==SANTA_LEOPOLDINA else (pares or {}).get(ente)
+        if isinstance(corpo,BaseException):
+            raise corpo
+        if callable(corpo):
+            return corpo(req,timeout)
+        return Resposta(corpo)
+    return chamada
+
+
 class ColetaRedeTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory()
@@ -529,6 +556,65 @@ class ColetaRedeTests(unittest.TestCase):
         with patch('municipal.coleta.urlopen',side_effect=AssertionError('cache válido ignorado')) as rede:
             coleta.coletar_populacao_municipio(self.cache,2025,agora=lambda:self.dia,forcar=True)
         rede.assert_not_called()
+
+    def periodo(self):
+        return coleta.coletar_periodo_rgf(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
+
+    def test_period_choice_is_the_latest_closed_year_homologated(self):
+        extratos={a:extrato(a) for a in (2024,2025,2026)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)) as rede:
+            r=self.periodo()
+        self.assertEqual(rede.call_count,3)
+        self.assertEqual(r['status'],'consultada')
+        v=r['valores']
+        self.assertEqual((v['exercicio'],v['periodo'],v['periodicidade'],v['demonstrativo']),(2025,2,'S','RGF Simplificado'))
+        self.assertEqual((v['mais_recente_publicado']['exercicio'],v['mais_recente_publicado']['periodo']),(2026,1))
+        self.assertEqual(v['exercicios_consultados'],[2026,2025,2024])
+        self.assertIn('2025, 2º semestre',r['note'])
+
+    def test_partial_current_year_falls_back_to_the_previous_closed_year(self):
+        extratos={2026:extrato(2026),2025:erro_http(500),2024:extrato(2024)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)):
+            r=self.periodo()
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual((r['valores']['exercicio'],r['valores']['periodo']),(2024,2))
+        self.assertIn('2025:',r['note'])
+
+    def test_rectified_report_is_not_taken_as_delivered(self):
+        extratos={2026:extrato(2026),2025:extrato(2025,status='RE'),2024:extrato(2024)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)):
+            r=self.periodo()
+        self.assertEqual(r['valores']['exercicio'],2024)
+
+    def test_no_homologated_period_is_no_data(self):
+        extratos={a:extrato(a,status='RE') for a in (2024,2025,2026)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)):
+            r=self.periodo()
+        self.assertEqual(r['status'],'sem_dados')
+        self.assertEqual(r['valores'],{})
+
+    def test_every_extract_failing_is_unavailable(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(404)):
+            r=self.periodo()
+        self.assertEqual(r['status'],'indisponivel')
+
+    def test_rcl_uses_the_period_chosen_from_the_extract(self):
+        extratos={a:extrato(a) for a in (2024,2025,2026)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos,rgf=fixture('siconfi_rgf_2025_s2.json'))) as rede:
+            r=coleta.coletar_rcl(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
+        url_rgf=rede.call_args_list[-1].args[0].full_url
+        self.assertIn('an_exercicio=2025&in_periodicidade=S&nr_periodo=2',url_rgf)
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual(r['valores']['escolha_periodo']['exercicio'],2025)
+        self.assertIn('Período escolhido pelo extrato',r['note'])
+
+    def test_rcl_without_a_period_does_not_query_the_rgf(self):
+        extratos={a:extrato(a,status='RE') for a in (2024,2025,2026)}
+        with patch('municipal.coleta.urlopen',side_effect=siconfi(extratos)) as rede:
+            r=coleta.coletar_rcl(self.cache,esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
+        self.assertEqual(rede.call_count,3)
+        self.assertEqual(r['status'],'sem_dados')
+        self.assertEqual(r['id'],'siconfi_rgf_pessoal')
 
     def test_cache_write_is_atomic_and_leaves_no_temporary_file(self):
         with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
