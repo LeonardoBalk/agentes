@@ -1,12 +1,20 @@
-"""testes da leitura das respostas do SICONFI e do IBGE, sem rede."""
+"""testes da coleta no SICONFI e no IBGE, sem rede e sem espera real."""
 
 import copy
+import gzip
 import hashlib
+import io
 import json
+import tempfile
+import threading
+import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError, URLError
 
+from municipal import coleta
 from municipal.coleta import (COLETAS, STATUS, DataError, ler_populacao_municipio, ler_populacao_municipios,
                               ler_rgf_pessoal, nao_consultadas, resultado, valor_api, validar_populacao)
 
@@ -215,6 +223,265 @@ class ColetaTests(unittest.TestCase):
         fonte=(ROOT/'municipal'/'coleta.py').read_text(encoding='utf-8')
         self.assertNotIn('import requests',fonte)
         self.assertNotIn('from requests',fonte)
+
+
+
+class Resposta:
+    """resposta HTTP falsa no formato que urlopen devolve."""
+    def __init__(self,corpo: bytes,cabecalhos=None):
+        self.corpo,self.status,self.headers=io.BytesIO(corpo),200,cabecalhos or {}
+    def read(self,n=-1):
+        return self.corpo.read(n)
+    def __enter__(self):
+        return self
+    def __exit__(self,*args):
+        return False
+
+
+class Relogio:
+    """relógio monotônico falso: esperar avança o tempo sem dormir."""
+    def __init__(self):
+        self.agora=1000.0
+        self.esperas=[]
+    def __call__(self):
+        return self.agora
+    def esperar(self,segundos):
+        self.esperas.append(segundos)
+        self.agora+=segundos
+
+
+def erro_http(codigo: int):
+    def levantar(req,timeout):
+        raise HTTPError(req.full_url,codigo,'erro',{},io.BytesIO(b'{"statusCode":%d}'%codigo))
+    return levantar
+
+
+def responder(*respostas):
+    """side_effect que devolve as respostas na ordem; cada uma é bytes, exceção ou função(req)."""
+    fila=list(respostas)
+    def chamada(req,timeout):
+        item=fila.pop(0) if len(fila)>1 else fila[0]
+        if isinstance(item,BaseException):
+            raise item
+        if callable(item):
+            return item(req,timeout)
+        return Resposta(item)
+    return chamada
+
+
+class ColetaRedeTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory()
+        self.cache=Path(self.temp.name)/'runtime'/'coleta.json'
+        self.relogio=Relogio()
+        self.dia=datetime(2026,10,27,12,tzinfo=timezone.utc)
+        # ritmo novo a cada teste: o intervalo não vaza de um teste para outro.
+        ritmo=patch('municipal.coleta.RITMO_SICONFI',coleta.Ritmo(coleta.INTERVALO_SICONFI))
+        ritmo.start()
+        self.addCleanup(ritmo.stop)
+        self.addCleanup(self.temp.cleanup)
+
+    def rgf(self,**extra):
+        opcoes=dict(esperar=self.relogio.esperar,relogio=self.relogio,agora=lambda:self.dia)
+        opcoes.update(extra)
+        return coleta.coletar_rgf_pessoal(self.cache,2025,2,**opcoes)
+
+    def populacao(self):
+        return coleta.coletar_populacao_municipio(self.cache,2025,esperar=self.relogio.esperar,agora=lambda:self.dia)
+
+    def test_happy_path_returns_consulted_values_from_the_public_base(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('siconfi_rgf_2025_s2.json'))) as rede:
+            r=self.rgf()
+        self.assertEqual(r['status'],'consultada')
+        self.assertFalse(r['desatualizado'])
+        self.assertEqual(r['valores']['rcl_ajustada'],91_455_881.05)
+        pedido=rede.call_args.args[0]
+        self.assertTrue(pedido.full_url.startswith('https://apidatalake.tesouro.gov.br/ords/cdwhprd/siconfi/tt/rgf?'))
+        self.assertIn('co_tipo_demonstrativo=RGF%20Simplificado',pedido.full_url)
+        self.assertEqual(rede.call_args.kwargs['timeout'],20)
+        self.assertEqual(r['content_sha256'],hashlib.sha256(fixture('siconfi_rgf_2025_s2.json')).hexdigest())
+
+    def test_http_500_is_tried_three_times_then_unavailable(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(500)) as rede:
+            r=self.populacao()
+        self.assertEqual(rede.call_count,3)
+        self.assertEqual(r['status'],'indisponivel')
+        self.assertIn('3 tentativas',r['note'])
+        self.assertIn('HTTP 500',r['note'])
+
+    def test_timeout_and_connection_errors_are_tried_three_times(self):
+        for erro in (TimeoutError('timed out'),URLError(ConnectionRefusedError()),URLError(OSError('dns'))):
+            with self.subTest(erro=erro):
+                self.relogio.esperas.clear()
+                self.cache.unlink(missing_ok=True)
+                with patch('municipal.coleta.urlopen',side_effect=erro) as rede:
+                    r=self.populacao()
+                self.assertEqual(rede.call_count,3)
+                self.assertEqual(r['status'],'indisponivel')
+                self.assertIn('3 tentativas',r['note'])
+
+    def test_client_errors_are_not_retried(self):
+        for codigo in (400,401,404):
+            with self.subTest(codigo=codigo):
+                self.relogio.esperas.clear()
+                with patch('municipal.coleta.urlopen',side_effect=erro_http(codigo)) as rede:
+                    r=self.populacao()
+                self.assertEqual(rede.call_count,1)
+                self.assertEqual(self.relogio.esperas,[])
+                self.assertEqual(r['status'],'indisponivel')
+                self.assertIn('1 tentativa',r['note'])
+
+    def test_http_429_is_retried_and_can_recover(self):
+        limite=erro_http(429)
+        with patch('municipal.coleta.urlopen',side_effect=responder(limite,fixture('ibge_populacao_santa_leopoldina.json'))) as rede:
+            r=self.populacao()
+        self.assertEqual(rede.call_count,2)
+        self.assertEqual(r['status'],'consultada')
+
+    def test_waits_are_five_then_fifteen_seconds(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            self.populacao()
+        self.assertEqual(self.relogio.esperas,[5,15])
+
+    def test_oversized_response_is_not_retried(self):
+        with patch.object(coleta,'TETO_BYTES',100),\
+             patch('municipal.coleta.urlopen',side_effect=responder(b'[' + b' '*200 + b']')) as rede:
+            r=self.populacao()
+        self.assertEqual(rede.call_count,1)
+        self.assertEqual(r['status'],'indisponivel')
+        self.assertIn('maior que',r['note'])
+
+    def test_gzip_body_is_decompressed_before_reading(self):
+        corpo=gzip.compress(fixture('ibge_populacao_es.json'))
+        resposta=lambda req,timeout:Resposta(corpo,{'Content-Encoding':'gzip'})
+        with patch('municipal.coleta.urlopen',side_effect=resposta):
+            r=coleta.coletar_populacao_municipios(self.cache,2025,agora=lambda:self.dia)
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual(len(r['valores']['municipios']),78)
+
+    def test_consecutive_siconfi_requests_are_at_least_one_second_apart(self):
+        instantes=[]
+        def registrar(req,timeout):
+            instantes.append(self.relogio())
+            return Resposta(fixture('siconfi_rgf_2025_s2.json'))
+        inicio=time.monotonic()
+        with patch('municipal.coleta.urlopen',side_effect=registrar):
+            coleta.buscar_siconfi('rgf',{'a':1},self.relogio.esperar,self.relogio)
+            coleta.buscar_siconfi('rgf',{'a':2},self.relogio.esperar,self.relogio)
+        self.assertGreaterEqual(instantes[1]-instantes[0],1.0)
+        self.assertLess(time.monotonic()-inicio,0.5)
+
+    def test_throttle_serializes_threads(self):
+        ritmo=coleta.Ritmo(0.02)
+        instantes,trava=[],threading.Lock()
+        def chamar():
+            ritmo.aguardar()
+            with trava:
+                instantes.append(time.monotonic())
+        threads=[threading.Thread(target=chamar) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        instantes.sort()
+        self.assertTrue(all(b-a>=0.019 for a,b in zip(instantes,instantes[1:])))
+
+    def test_ibge_requests_are_not_throttled(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'),
+                                                                     fixture('ibge_populacao_es.json'))):
+            self.populacao()
+            coleta.coletar_populacao_municipios(self.cache,2025,esperar=self.relogio.esperar,agora=lambda:self.dia)
+        self.assertEqual(self.relogio.esperas,[])
+
+    def test_pagination_joins_items_from_every_page(self):
+        itens=json.loads(fixture('siconfi_rgf_2025_s2.json'))['items']
+        interno='https://host-5hrds-scan.prosubnet.vcndados.oraclevcn.com/ords/cdwhprd/siconfi/tt/rgf?offset=200'
+        pagina1=dict(items=itens[:200],hasMore=True,limit=200,offset=0,count=200,links=[dict(rel='next',href=interno)])
+        pagina2=dict(items=itens[200:],hasMore=False,limit=200,offset=200,count=len(itens)-200,links=[])
+        with patch('municipal.coleta.urlopen',side_effect=responder(json.dumps(pagina1).encode(),json.dumps(pagina2).encode())) as rede:
+            r=self.rgf()
+        urls=[c.args[0].full_url for c in rede.call_args_list]
+        self.assertEqual(len(urls),2)
+        self.assertTrue(all(u.startswith(coleta.SICONFI_BASE) for u in urls))
+        self.assertTrue(urls[1].endswith('&offset=200&limit=200'))
+        self.assertEqual(r['status'],'consultada')
+        self.assertEqual(r['valores']['despesa_pessoal'],38_129_707.36)
+        self.assertEqual(self.relogio.esperas,[coleta.INTERVALO_SICONFI])
+
+    def test_pagination_stuck_on_has_more_stops_at_the_cap(self):
+        pagina=json.dumps(dict(items=[{}],hasMore=True,limit=1,offset=0,count=1)).encode()
+        with patch('municipal.coleta.urlopen',side_effect=responder(pagina)) as rede:
+            r=self.rgf()
+        self.assertEqual(rede.call_count,coleta.TETO_PAGINAS)
+        self.assertEqual(r['status'],'indisponivel')
+        self.assertIn(f'depois de {coleta.TETO_PAGINAS}',r['note'])
+
+    def test_two_calls_within_validity_make_a_single_request(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('siconfi_rgf_2025_s2.json'))) as rede:
+            primeiro=self.rgf()
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('não deveria acessar a rede')) as rede:
+            self.dia+=timedelta(days=6)
+            segundo=self.rgf()
+        rede.assert_not_called()
+        self.assertEqual(segundo,primeiro)
+
+    def test_expired_cache_calls_urlopen_again(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('siconfi_rgf_2025_s2.json'))):
+            self.rgf()
+        self.dia+=coleta.VALIDADE['siconfi_rgf_pessoal']+timedelta(seconds=1)
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('siconfi_rgf_2025_s2.json'))) as rede:
+            r=self.rgf()
+        self.assertEqual(rede.call_count,1)
+        self.assertEqual(r['checked_at'],self.dia.isoformat())
+
+    def test_cached_value_for_another_query_is_not_reused(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('siconfi_rgf_2025_s2.json'))):
+            self.rgf()
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('siconfi_rgf_erro_periodicidade_q.json'))) as rede:
+            r=coleta.coletar_rgf_pessoal(self.cache,2024,2,esperar=self.relogio.esperar,relogio=self.relogio,
+                                         agora=lambda:self.dia)
+        self.assertEqual(rede.call_count,1)
+        self.assertEqual(r['status'],'sem_dados')
+
+    def test_corrupted_or_unexpected_cache_is_treated_as_empty(self):
+        for conteudo in ('isto não é json','[]','{"outra_fonte": {}}','{"ibge_populacao": {"url": 1}}'):
+            with self.subTest(conteudo=conteudo):
+                self.cache.parent.mkdir(parents=True,exist_ok=True)
+                self.cache.write_text(conteudo,encoding='utf-8')
+                with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))) as rede:
+                    r=self.populacao()
+                self.assertEqual(rede.call_count,1)
+                self.assertEqual(r['status'],'consultada')
+                self.assertEqual(set(coleta.ler_cache(self.cache)),{'ibge_populacao'})
+
+    def test_failed_refresh_returns_the_last_good_value_marked_as_stale(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
+            bom=self.populacao()
+        self.dia+=timedelta(days=45)
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            r=self.populacao()
+        self.assertEqual(r['status'],'consultada')
+        self.assertTrue(r['desatualizado'])
+        self.assertEqual(r['valores'],bom['valores'])
+        self.assertEqual(r['checked_at'],bom['checked_at'])
+        self.assertIn('há 45 dias',r['note'])
+        self.assertIn('HTTP 503',r['note'])
+        entrada=coleta.ler_cache(self.cache)['ibge_populacao']
+        self.assertEqual(entrada['ultima_tentativa']['status'],'indisponivel')
+        self.assertEqual(entrada['ultimo_bom']['valores']['populacao'],13813)
+
+    def test_failed_refresh_without_cached_value_is_unavailable(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            r=self.populacao()
+        self.assertEqual(r['status'],'indisponivel')
+        self.assertFalse(r['desatualizado'])
+        self.assertEqual(r['valores'],{})
+
+    def test_cache_write_is_atomic_and_leaves_no_temporary_file(self):
+        with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
+            self.populacao()
+        self.assertEqual([p.name for p in self.cache.parent.iterdir()],['coleta.json'])
+        self.assertEqual(json.loads(self.cache.read_text(encoding='utf-8'))['ibge_populacao']['ultimo_bom']['valores']['populacao'],13813)
 
 
 if __name__=='__main__':
