@@ -7,6 +7,7 @@ import http.client
 import json
 import math
 import re
+import threading
 import time
 from typing import Any, Callable
 from urllib.error import HTTPError
@@ -369,3 +370,28 @@ def buscar(url: str, esperar: Callable[[float], None] = time.sleep,
             raise FalhaColeta(f'Consulta não concluída após {tentativa} {plural}: {motivo}.', tentativa)
         esperar(ESPERAS[tentativa - 1])
     raise AssertionError('inalcançável')
+
+
+# "Para fins de performance, o limite é de uma (01) requisição por segundo" (siconfi.yaml). O intervalo
+# é medido entre inícios de requisição aqui; 0,1 s de folga cobre a variação de latência até o servidor.
+INTERVALO_SICONFI = 1.1
+
+
+class Ritmo:
+    """intervalo mínimo entre requisições a um host, seguro entre threads do ThreadingHTTPServer."""
+    def __init__(self, intervalo: float):
+        self.intervalo = intervalo
+        self.trava = threading.Lock()
+        self.ultima = None
+
+    def aguardar(self, relogio: Callable[[], float] = time.monotonic,
+                 esperar: Callable[[float], None] = time.sleep) -> None:
+        with self.trava:
+            if self.ultima is not None:
+                falta = self.intervalo - (relogio() - self.ultima)
+                if falta > 0:
+                    esperar(falta)
+            self.ultima = relogio()
+
+
+RITMO_SICONFI = Ritmo(INTERVALO_SICONFI)
