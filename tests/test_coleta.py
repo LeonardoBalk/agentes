@@ -5,6 +5,7 @@ import hashlib
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from municipal.coleta import (COLETAS, STATUS, DataError, ler_populacao_municipio, ler_populacao_municipios,
                               ler_rgf_pessoal, nao_consultadas, resultado, valor_api, validar_populacao)
@@ -202,11 +203,18 @@ class ColetaTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             resultado('siconfi_rgf_pessoal',URL_RGF,'ok','status fora do contrato')
 
-    def test_parsers_do_not_touch_the_network(self):
+    def test_readers_only_parse_bytes_and_never_open_connections(self):
+        with patch('municipal.coleta.urlopen',side_effect=AssertionError('leitor não pode abrir conexão')) as rede:
+            self.assertEqual(ler_rgf_pessoal(fixture('siconfi_rgf_2025_s2.json'),URL_RGF)['status'],'consultada')
+            self.assertEqual(ler_populacao_municipio(fixture('ibge_populacao_santa_leopoldina.json'),URL_IBGE,
+                                                     SANTA_LEOPOLDINA,2025)['status'],'consultada')
+            self.assertEqual(ler_populacao_municipios(fixture('ibge_populacao_es.json'),URL_IBGE,2025)['status'],'consultada')
+        rede.assert_not_called()
+
+    def test_project_does_not_depend_on_requests(self):
         fonte=(ROOT/'municipal'/'coleta.py').read_text(encoding='utf-8')
-        for proibido in ('urlopen','urllib','http.client','socket','requests'):
-            with self.subTest(proibido=proibido):
-                self.assertNotIn(proibido,fonte)
+        self.assertNotIn('import requests',fonte)
+        self.assertNotIn('from requests',fonte)
 
 
 if __name__=='__main__':

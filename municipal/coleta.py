@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import math
 import re
 from typing import Any
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 
 from municipal.dados import DataError
 from municipal.fontes import now
@@ -279,3 +282,41 @@ def ler_populacao_municipios(conteudo: bytes, url: str, ano: int, checked_at: st
         return resultado('ibge_populacao_municipios', url, 'consultada', nota, valores, conteudo, checked_at)
     except DataError as e:
         return resultado('ibge_populacao_municipios', url, 'indisponivel', str(e), conteudo=conteudo, checked_at=checked_at)
+
+
+# ---------------------------------------------------------------- rede
+
+TIMEOUT = 20
+# uma página cheia do SICONFI tem até 5.000 itens; no RREO real foram ~400 bytes por item, o que dá
+# ~2 MB por página. 4 MB deixa o dobro de folga; mais que isso não é resposta que esperamos.
+TETO_BYTES = 4_000_000
+# o fontes.py se passa por navegador porque o planalto.gov.br exige. SICONFI e IBGE responderam ao
+# curl na etapa 1, então aqui o app se identifica. Accept-Language é o mesmo do fontes.py.
+CABECALHOS = {'User-Agent': 'LeopoldinAI/1.0 (coleta de dados fiscais)',
+              'Accept-Language': 'pt-BR,pt;q=0.9', 'Accept': 'application/json'}
+
+
+class FalhaRede(Exception):
+    """falha antes de haver resposta HTTP utilizável."""
+    def __init__(self, motivo: str, passageira: bool):
+        super().__init__(motivo)
+        self.passageira = passageira
+
+
+def baixar(url: str) -> tuple[int, bytes]:
+    """status HTTP e bytes brutos da resposta, inclusive em 4xx/5xx; falha de rede vira FalhaRede."""
+    try:
+        try:
+            with urlopen(Request(url, headers=CABECALHOS), timeout=TIMEOUT) as resposta:
+                status, conteudo = resposta.status, resposta.read(TETO_BYTES + 1)
+        except HTTPError as e:
+            # urllib levanta exceção em 4xx/5xx; o corpo e o código continuam valendo para quem classifica.
+            with e:
+                status, conteudo = e.code, e.read(TETO_BYTES + 1)
+    except (OSError, http.client.HTTPException) as e:
+        # OSError cobre timeout, conexão recusada e DNS; URLError é subclasse e guarda a causa em reason.
+        causa = e.reason if isinstance(getattr(e, 'reason', None), BaseException) else e
+        raise FalhaRede(f'falha de rede ({type(causa).__name__})', passageira=True) from e
+    if len(conteudo) > TETO_BYTES:
+        raise FalhaRede(f'resposta maior que {TETO_BYTES // 1_000_000} MB', passageira=False)
+    return status, conteudo
