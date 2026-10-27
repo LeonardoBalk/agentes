@@ -84,3 +84,92 @@ def ler_json(conteudo: bytes, rotulo: str) -> Any:
         return json.loads(conteudo.decode('utf-8'))
     except (UnicodeDecodeError, ValueError) as e:
         raise DataError(f'{rotulo}: resposta não é JSON válido ({type(e).__name__}).') from e
+
+
+# ---------------------------------------------------------------- siconfi rgf
+
+ANEXO_PESSOAL = 'RGF-Anexo 01'
+COLUNA_VALOR = 'Valor'
+COLUNA_PCT = '% sobre a RCL Ajustada'
+
+# campo -> (cod_conta, coluna), conforme a resposta real do RGF Simplificado 2025 (ETAPA1_APIS.md).
+# Os limites da LRF são lidos da api, nunca fixados aqui. Os percentuais publicados têm como
+# denominador a RCL ajustada, não a RCL: por isso o sufixo _pct_rcl_ajustada.
+CAMPOS_RGF = dict(
+    rcl=('ReceitaCorrenteLiquidaLimiteLegal', COLUNA_VALOR),
+    # rcl menos as transferências que a LRF manda excluir; é a base dos limites de pessoal.
+    rcl_ajustada=('ReceitaCorrenteLiquidaAjustada', COLUNA_VALOR),
+    despesa_pessoal=('DespesaComPessoalTotal', COLUNA_VALOR),
+    limite_maximo=('LimiteMaximoDespesaComPessoalTotal', COLUNA_VALOR),
+    limite_maximo_pct_rcl_ajustada=('LimiteMaximoDespesaComPessoalTotal', COLUNA_PCT),
+    limite_prudencial=('LimitePrudencialDespesaComPessoalTotal', COLUNA_VALOR),
+    limite_prudencial_pct_rcl_ajustada=('LimitePrudencialDespesaComPessoalTotal', COLUNA_PCT),
+    limite_alerta=('LimiteDeAlertaDespesaComPessoalTotal', COLUNA_VALOR),
+    limite_alerta_pct_rcl_ajustada=('LimiteDeAlertaDespesaComPessoalTotal', COLUNA_PCT),
+)
+# percentual que o próprio demonstrativo publica; se vier, confere a razão calculada.
+CONFERENCIA_RGF = ('DespesaComPessoalTotal', COLUNA_PCT)
+TOLERANCIA_PCT = 0.01
+
+
+def ler_rgf_pessoal(conteudo: bytes, url: str, checked_at: str | None = None) -> dict:
+    """RCL, RCL ajustada, despesa com pessoal e limites a partir dos bytes do /rgf. Não baixa nada."""
+    def falha(nota):
+        return resultado('siconfi_rgf_pessoal', url, 'indisponivel', nota, conteudo=conteudo, checked_at=checked_at)
+    try:
+        payload = ler_json(conteudo, url)
+        if not isinstance(payload, dict) or not isinstance(payload.get('items'), list):
+            titulo = payload.get('title') if isinstance(payload, dict) else None
+            return falha('Resposta sem a lista de itens do SICONFI'
+                         + (f' (corpo de erro: {titulo}).' if isinstance(titulo, str) else '.'))
+        itens = payload['items']
+        if not itens or payload.get('count') == 0:
+            return resultado('siconfi_rgf_pessoal', url, 'sem_dados',
+                             'O SICONFI respondeu sem registros para estes parâmetros. Confira exercício, período e se o ente publica o demonstrativo simplificado.',
+                             conteudo=conteudo, checked_at=checked_at)
+        if payload.get('hasMore') is not False:
+            # paginação fica para a etapa de rede; sem hasMore=false não dá para garantir a resposta inteira.
+            return falha('Resposta truncada pela paginação do SICONFI ou sem o indicador hasMore. Os valores não foram lidos.')
+
+        anexo = [i for i in itens if isinstance(i, dict) and i.get('anexo') == ANEXO_PESSOAL]
+        valores, faltantes = {}, []
+        for campo, (cod_conta, coluna) in CAMPOS_RGF.items():
+            linhas = [i for i in anexo if i.get('cod_conta') == cod_conta and i.get('coluna') == coluna]
+            if not linhas:
+                faltantes.append(f'{cod_conta} ({coluna})')
+                continue
+            if len(linhas) > 1:
+                return falha(f'{cod_conta} ({coluna}) aparece {len(linhas)} vezes no {ANEXO_PESSOAL}; valor ambíguo.')
+            valores[campo] = valor_api(linhas[0].get('valor'), f'{url} {cod_conta} ({coluna})')
+        if faltantes:
+            return falha(f'Campos obrigatórios ausentes no {ANEXO_PESSOAL}: {", ".join(faltantes)}.')
+
+        periodos = {(i.get('exercicio'), i.get('periodo'), i.get('periodicidade')) for i in anexo}
+        if len(periodos) != 1:
+            return falha(f'O {ANEXO_PESSOAL} mistura exercícios ou períodos: {sorted(map(str, periodos))}.')
+        exercicio, periodo, periodicidade = periodos.pop()
+        if (isinstance(exercicio, bool) or not isinstance(exercicio, int) or isinstance(periodo, bool)
+                or not isinstance(periodo, int) or periodicidade not in ('Q', 'S')):
+            return falha(f'Exercício, período ou periodicidade inválidos: {exercicio!r}, {periodo!r}, {periodicidade!r}.')
+
+        if valores['rcl_ajustada'] == 0:
+            return falha('RCL ajustada igual a zero; a razão da despesa com pessoal não pode ser calculada.')
+        # denominador: RCL ajustada, a mesma base dos limites publicados no anexo.
+        razao = round(valores['despesa_pessoal'] / valores['rcl_ajustada'] * 100, 2)
+        publicadas = [i for i in anexo if (i.get('cod_conta'), i.get('coluna')) == CONFERENCIA_RGF]
+        if len(publicadas) == 1:
+            publicada = valor_api(publicadas[0].get('valor'), f'{url} {CONFERENCIA_RGF[0]} ({CONFERENCIA_RGF[1]})')
+            if abs(publicada - razao) > TOLERANCIA_PCT:
+                return falha(f'A razão calculada ({razao}%) diverge da publicada no demonstrativo ({publicada}%).')
+
+        valores.update(despesa_pessoal_pct_rcl_ajustada=razao, exercicio=exercicio, periodo=periodo,
+                       periodicidade=periodicidade)
+        nota = (f'RGF {exercicio}, período {periodo} ({"semestral" if periodicidade == "S" else "quadrimestral"}). '
+                'Limites e percentuais lidos do demonstrativo, sobre a RCL ajustada.')
+        populacao = {i.get('populacao') for i in anexo}
+        if len(populacao) == 1:
+            # o SICONFI traz uma população própria, que diverge do IBGE (15830 x 13813 em 2025).
+            nota += f' População informada pelo SICONFI ({populacao.pop()}) não é usada; a população vem do IBGE.'
+        return resultado('siconfi_rgf_pessoal', url, 'consultada', nota, valores, conteudo, checked_at)
+    except DataError as e:
+        return falha(str(e))
