@@ -1,6 +1,7 @@
 """testes de dados, cálculos e revisão."""
 
 import copy
+import importlib.util
 import json
 import tempfile
 import unittest
@@ -378,6 +379,7 @@ class CoreTests(unittest.TestCase):
         ids={a['id'] for a in agente.resumir_simulacao(scenario)['actions']}
         self.assertEqual(ids,{a['id'] for a in scenario['actions']})
 
+    @unittest.skipUnless(importlib.util.find_spec('openai'),'openai vem de requirements-ai.txt')
     def test_groq_loop_forces_the_four_tools_and_a_json_answer(self):
         scenario=simulate(self.data)
         fontes=[dict(id='lrf',title='LRF',status='consultada',dispositivos=[])]
