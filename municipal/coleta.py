@@ -343,7 +343,10 @@ def baixar(url: str) -> tuple[int, bytes]:
     except (OSError, http.client.HTTPException) as e:
         # OSError cobre timeout, conexão recusada e DNS; URLError é subclasse e guarda a causa em reason.
         causa = e.reason if isinstance(getattr(e, 'reason', None), BaseException) else e
-        raise FalhaRede(f'falha de rede ({type(causa).__name__})', passageira=True) from e
+        # a nota vai para a tela: frase para quem usa o app, não nome de exceção.
+        motivo = ('o servidor demorou demais para responder' if isinstance(causa, TimeoutError)
+                  else 'sem conexão com o servidor (confira a internet)')
+        raise FalhaRede(motivo, passageira=True) from e
     if len(conteudo) > TETO_BYTES:
         raise FalhaRede(f'resposta maior que {TETO_BYTES // 1_000_000} MB', passageira=False)
     return status, descompactar(conteudo, codificacao)
@@ -373,9 +376,12 @@ ESPERAS = (5, 15)
 
 class FalhaColeta(Exception):
     """a busca desistiu; a nota já está pronta para o resultado."""
-    def __init__(self, nota: str, tentativas: int):
+    def __init__(self, nota: str, tentativas: int, sem_resposta: bool = False):
         super().__init__(nota)
         self.tentativas = tentativas
+        # True quando nenhuma tentativa chegou a ter resposta HTTP (sem conexão, DNS, timeout): o serviço
+        # está fora de alcance para qualquer consulta, não só para esta.
+        self.sem_resposta = sem_resposta
 
 
 def classificar_status(status: int) -> tuple[str, bool]:
@@ -398,12 +404,14 @@ def buscar(url: str, esperar: Callable[[float], None] = time.sleep,
             if 200 <= status < 300:
                 return conteudo
             motivo, passageira = classificar_status(status)
+            sem_resposta = False
         except FalhaRede as e:
             motivo, passageira = str(e), e.passageira
+            sem_resposta = e.passageira
         if not passageira or tentativa == TENTATIVAS:
             # o 500 do IBGE para município inexistente é permanente, mas só se sabe depois das tentativas.
             plural = 'tentativa' if tentativa == 1 else 'tentativas'
-            raise FalhaColeta(f'Consulta não concluída após {tentativa} {plural}: {motivo}.', tentativa)
+            raise FalhaColeta(f'Consulta não concluída após {tentativa} {plural}: {motivo}.', tentativa, sem_resposta)
         esperar(ESPERAS[tentativa - 1])
     raise AssertionError('inalcançável')
 
@@ -574,11 +582,23 @@ def ler_cache(cache: Path) -> dict:
     return dados
 
 
+TENTATIVAS_GRAVACAO = 5
+
+
 def gravar_cache(cache: Path, dados: dict) -> None:
     cache.parent.mkdir(parents=True, exist_ok=True)
     temp = cache.with_suffix('.tmp')
     temp.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding='utf-8')
-    temp.replace(cache)
+    # no Windows, replace falha com PermissionError se a tela estiver lendo o arquivo nesse instante
+    # (a leitura é sem trava); a leitura dura milissegundos, então basta tentar de novo.
+    for tentativa in range(TENTATIVAS_GRAVACAO):
+        try:
+            temp.replace(cache)
+            return
+        except PermissionError:
+            if tentativa == TENTATIVAS_GRAVACAO - 1:
+                raise
+            time.sleep(0.05)
 
 
 def coletar(cache: Path, fonte_id: str, chave: str, obter: Callable[[str], dict],
@@ -608,8 +628,7 @@ def coletar(cache: Path, fonte_id: str, chave: str, obter: Callable[[str], dict]
         if not forcar and ultima and ultima['status'] != 'consultada':
             desde = momento - instante(entrada['ultima_tentativa_em'])
             if timedelta(0) <= desde < RECUO:
-                aviso = (f'Nova tentativa automática em {descrever_idade(RECUO - desde)}; '
-                         'o botão de atualizar tenta na hora.')
+                aviso = aviso_recuo(desde)
                 if bom:
                     return valor_velho(bom, ultima, momento - instante(bom_em), aviso)
                 # sem valor bom: a própria falha, sem rede. Se ela foi sem_dados, continua sem_dados.
@@ -625,19 +644,26 @@ def coletar(cache: Path, fonte_id: str, chave: str, obter: Callable[[str], dict]
         return valor_velho(bom, novo, momento - instante(bom_em))
 
 
+def aviso_recuo(desde: timedelta) -> str:
+    return (f'Nova tentativa liberada em {descrever_idade(RECUO - desde)}; para tentar antes, '
+            'use "Tentar de novo agora" na tela de Situação.')
+
+
 def do_cache(cache: Path, fonte_id: str, chave: str, momento: datetime) -> dict:
     """o que o cache tem para esta consulta, sem rede e sem trava (a gravação é atômica)."""
     entrada = ler_cache(cache).get(fonte_id)
     if not entrada or entrada['chave'] != chave:
         return resultado(fonte_id, None, 'nao_consultada', 'Ainda não coletado. Use o botão de coletar.')
     bom, ultima = entrada['ultimo_bom'], entrada['ultima_tentativa']
+    desde = momento - instante(entrada['ultima_tentativa_em'])
+    aviso = aviso_recuo(desde) if ultima['status'] != 'consultada' and timedelta(0) <= desde < RECUO else ''
     if not bom:
-        return dict(ultima)
+        return {**ultima, 'note': f"{ultima['note']} {aviso}".strip()}
     idade = momento - instante(entrada['ultimo_bom_em'])
     if timedelta(0) <= idade < VALIDADE[fonte_id]:
         return dict(bom)
     if ultima['status'] != 'consultada':
-        return valor_velho(bom, ultima, idade)
+        return valor_velho(bom, ultima, idade, aviso)
     return {**bom, 'desatualizado': True,
             'note': f"{bom['note']} Valor coletado há {descrever_idade(idade)}; a validade de "
                     f"{VALIDADE[fonte_id].days} dias venceu e a tela não consulta a rede sozinha. Use o botão de coletar."}
@@ -785,9 +811,13 @@ def coletar_periodo_rgf(cache: Path, id_ente: int = MUNICIPIO_PADRAO, ano: int |
                 corpos.append(conteudo)
             except (FalhaColeta, DataError) as e:
                 falhas.append(f'{a}: {e}')
+                if getattr(e, 'sem_resposta', False):
+                    # sem conexão vale para os três anos: insistir só triplica a espera de quem clicou.
+                    falhas.append('Os outros exercícios não foram consultados.')
+                    break
         # sha256 da concatenação das respostas, na ordem dos exercícios consultados.
         conteudo = b''.join(corpos) if corpos else None
-        if len(falhas) == len(anos):
+        if not corpos:
             return resultado('siconfi_extrato', urls[ano], 'indisponivel',
                              'Nenhum extrato de entregas pôde ser lido. ' + ' '.join(falhas), checked_at=checked_at)
         escolhido, recente = escolher_periodo(entregas_rgf(itens, id_ente))

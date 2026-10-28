@@ -420,19 +420,36 @@ class ColetaRedeTests(unittest.TestCase):
         self.assertLess(time.monotonic()-inicio,0.5)
 
     def test_throttle_serializes_threads(self):
+        # os instantes são os que o próprio Ritmo lê dentro da trava: medir fora dela daria falso negativo,
+        # sobretudo no relógio menos fino do Windows.
+        lidos=[]
+        def relogio():
+            lidos.append(time.monotonic())
+            return lidos[-1]
         ritmo=coleta.Ritmo(0.02)
-        instantes,trava=[],threading.Lock()
-        def chamar():
-            ritmo.aguardar()
-            with trava:
-                instantes.append(time.monotonic())
-        threads=[threading.Thread(target=chamar) for _ in range(5)]
+        threads=[threading.Thread(target=ritmo.aguardar,args=(relogio,)) for _ in range(5)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        instantes.sort()
-        self.assertTrue(all(b-a>=0.019 for a,b in zip(instantes,instantes[1:])))
+        # cada chamada depois da primeira lê o relógio duas vezes (conferir e registrar); a primeira, uma.
+        registrados=[lidos[0]]+lidos[2::2]
+        self.assertEqual(len(registrados),5)
+        self.assertTrue(all(b-a>=0.02 for a,b in zip(registrados,registrados[1:])))
+
+    def test_cache_write_retries_when_windows_holds_the_file(self):
+        original=Path.replace
+        falhas=[]
+        def replace_ocupado(origem,destino):
+            if not falhas:
+                falhas.append(1)
+                raise PermissionError(13,'arquivo em uso')
+            return original(origem,destino)
+        with patch.object(Path,'replace',replace_ocupado),patch('municipal.coleta.time.sleep'):
+            coleta.gravar_cache(self.cache,{})
+        self.assertEqual(falhas,[1])
+        self.assertEqual(coleta.ler_cache(self.cache),{})
+        self.assertFalse(self.cache.with_suffix('.tmp').exists())
 
     def test_ibge_requests_are_not_throttled(self):
         with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'),
@@ -535,7 +552,7 @@ class ColetaRedeTests(unittest.TestCase):
         rede.assert_not_called()
         self.assertLess(time.monotonic()-inicio,0.5)
         self.assertEqual(r['status'],'indisponivel')
-        self.assertIn('Nova tentativa automática em 3 min',r['note'])
+        self.assertIn('Nova tentativa liberada em 3 min',r['note'])
 
     def test_backoff_serves_the_last_good_value_as_stale(self):
         with patch('municipal.coleta.urlopen',side_effect=responder(fixture('ibge_populacao_santa_leopoldina.json'))):
@@ -549,7 +566,19 @@ class ColetaRedeTests(unittest.TestCase):
         rede.assert_not_called()
         self.assertEqual(r['status'],'consultada')
         self.assertTrue(r['desatualizado'])
-        self.assertIn('Nova tentativa automática em 4 min',r['note'])
+        self.assertIn('Nova tentativa liberada em 4 min',r['note'])
+
+    def test_cache_view_explains_the_backoff_after_a_failure(self):
+        with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
+            self.populacao()
+        self.dia+=timedelta(minutes=1)
+        r=coleta.coletar_populacao_municipio(self.cache,2025,agora=lambda:self.dia,somente_cache=True)
+        self.assertEqual(r['status'],'indisponivel')
+        self.assertIn('Nova tentativa liberada em 4 min',r['note'])
+        self.assertIn('Tentar de novo agora',r['note'])
+        self.dia+=coleta.RECUO
+        r=coleta.coletar_populacao_municipio(self.cache,2025,agora=lambda:self.dia,somente_cache=True)
+        self.assertNotIn('Nova tentativa liberada',r['note'])
 
     def test_after_the_backoff_the_source_is_tried_again(self):
         with patch('municipal.coleta.urlopen',side_effect=erro_http(503)):
@@ -599,6 +628,16 @@ class ColetaRedeTests(unittest.TestCase):
         self.assertEqual(r['status'],'consultada')
         self.assertEqual((r['valores']['exercicio'],r['valores']['periodo']),(2024,2))
         self.assertIn('2025:',r['note'])
+
+    def test_no_connection_stops_after_the_first_year_of_the_extract(self):
+        with patch('municipal.coleta.urlopen',side_effect=URLError(ConnectionRefusedError())) as rede:
+            r=self.periodo()
+        self.assertEqual(rede.call_count,coleta.TENTATIVAS)
+        self.assertEqual(self.relogio.esperas,[5,15])
+        self.assertEqual(r['status'],'indisponivel')
+        self.assertIn('sem conexão com o servidor (confira a internet)',r['note'])
+        self.assertIn('Os outros exercícios não foram consultados',r['note'])
+        self.assertNotIn('Error',r['note'])
 
     def test_rectified_report_counts_as_published_and_its_status_is_recorded(self):
         extratos={2026:extrato(2026),2025:extrato(2025,status='RE'),2024:extrato(2024)}
