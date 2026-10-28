@@ -198,6 +198,93 @@ function renderSources() {
   }).join('');
 }
 
+// Dados públicos do município real (SICONFI e IBGE). Vêm do cache do servidor; a tela não consulta a rede.
+const EXTERNAL_STATUS = { ...SOURCE_STATUS, sem_dados: { label: 'Sem dados publicados', kind: 'yellow' } };
+const reais = value => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(value);
+const pp = value => new Intl.NumberFormat('pt-BR', { maximumFractionDigits: 2 }).format(value) + '%';
+const day = value => new Intl.DateTimeFormat('pt-BR', { dateStyle: 'short', timeZone: 'America/Sao_Paulo' }).format(new Date(value));
+const semUF = nome => String(nome || '').replace(/ - [A-Z]{2}$/, '');
+const ENTREGA = { HO: 'homologado', RE: 'retificado' };
+
+function externalHeader(label, r) {
+  const status = EXTERNAL_STATUS[r.status] || { label: r.status, kind: '' };
+  return `<div class="tile-header"><div class="tile-label">${esc(label)}</div>
+    <span>${r.desatualizado ? tag('Desatualizado', 'yellow') + ' ' : ''}${tag(status.label, status.kind)}</span></div>
+    ${r.desatualizado ? `<div class="notice warning"><strong>Dado desatualizado: não é o valor mais recente.</strong>
+      <p>Coletado em ${date(r.checked_at)}. A última tentativa de atualizar não deu certo ou a validade venceu; veja a nota abaixo.</p></div>` : ''}`;
+}
+
+function externalFooter(r, periodo) {
+  const meta = [periodo, r.checked_at ? 'Coletado em ' + date(r.checked_at) : ''].filter(Boolean).join(' · ');
+  return `${meta ? `<p class="field-hint">${meta}</p>` : ''}<p class="field-hint">${esc(r.note)}</p>`;
+}
+
+// Faixa em que a razão caiu, pelos limites do próprio demonstrativo. Descreve; não é parecer de conformidade.
+function faixaPessoal(v) {
+  const razao = v.despesa_pessoal_pct_rcl_ajustada;
+  if (razao < v.limite_alerta_pct_rcl_ajustada) return `abaixo do limite de alerta publicado (${pp(v.limite_alerta_pct_rcl_ajustada)})`;
+  if (razao < v.limite_prudencial_pct_rcl_ajustada) return `entre o limite de alerta (${pp(v.limite_alerta_pct_rcl_ajustada)}) e o limite prudencial (${pp(v.limite_prudencial_pct_rcl_ajustada)}) publicados`;
+  if (razao < v.limite_maximo_pct_rcl_ajustada) return `entre o limite prudencial (${pp(v.limite_prudencial_pct_rcl_ajustada)}) e o limite máximo (${pp(v.limite_maximo_pct_rcl_ajustada)}) publicados`;
+  return `no limite máximo publicado (${pp(v.limite_maximo_pct_rcl_ajustada)}) ou acima dele`;
+}
+
+function renderRcl(r) {
+  const v = r.valores || {};
+  if (r.status !== 'consultada') return `<div class="tile">${externalHeader('RCL e limite de pessoal', r)}${externalFooter(r)}</div>`;
+  const e = v.escolha_periodo || {};
+  const periodo = `RGF ${v.exercicio}, ${v.periodo}º ${v.periodicidade === 'S' ? 'semestre' : 'quadrimestre'}${e.demonstrativo ? ' · ' + esc(e.demonstrativo) : ''}`
+    + (e.status_relatorio ? ` · ${ENTREGA[e.status_relatorio] || esc(e.status_relatorio)} em ${day(e.data_status)}` : '');
+  const c = v.conferencia_rreo;
+  const conferencia = !c ? '' : c.situacao === 'confere' ? 'A RCL confere com a do RREO do mesmo período.'
+    : c.situacao === 'diverge' ? `A RCL difere da do RREO do mesmo período (${reais(c.rcl_rreo)}); veja a nota.` : 'A conferência pelo RREO não pôde ser feita.';
+  const limite = (nome, valor, pct) => `<li><span>${nome} (${pp(pct)} da RCL ajustada)</span><strong>${reais(valor)}</strong></li>`;
+  return `<div class="tile">
+    ${externalHeader('RCL e limite de pessoal', r)}
+    <div class="tile-value">${pp(v.despesa_pessoal_pct_rcl_ajustada)}</div>
+    <p>Despesa com pessoal sobre a RCL ajustada: ${faixaPessoal(v)}. Leitura dos números publicados, não parecer sobre a lei.</p>
+    <ul class="summary-list">
+      <li><span>RCL</span><strong>${reais(v.rcl)}</strong></li>
+      <li><span>RCL ajustada</span><strong>${reais(v.rcl_ajustada)}</strong></li>
+      <li><span>Despesa com pessoal</span><strong>${reais(v.despesa_pessoal)}</strong></li>
+      ${limite('Limite máximo', v.limite_maximo, v.limite_maximo_pct_rcl_ajustada)}
+      ${limite('Limite prudencial', v.limite_prudencial, v.limite_prudencial_pct_rcl_ajustada)}
+      ${limite('Limite de alerta', v.limite_alerta, v.limite_alerta_pct_rcl_ajustada)}
+    </ul>
+    ${conferencia ? `<p class="field-hint">${conferencia}</p>` : ''}
+    ${externalFooter(r, periodo)}
+  </div>`;
+}
+
+function renderBenchmark(r) {
+  const v = r.valores || {};
+  if (r.status !== 'consultada') return `<div class="tile">${externalHeader('RCL por habitante entre municípios parecidos', r)}${externalFooter(r)}</div>`;
+  const m = v.municipio;
+  const p = v.posicao;
+  const excluidos = v.excluidos.length
+    ? `<p class="field-hint">Ficaram de fora por falta de dado: ${v.excluidos.map(e => esc(semUF(e.nome))).join(', ')}.</p>` : '';
+  return `<div class="tile">
+    ${externalHeader('RCL por habitante entre municípios parecidos', r)}
+    <div class="tile-value">${reais(m.rcl_per_capita)}</div>
+    <p>${esc(semUF(m.nome))}, ${v.exercicio}. Mediana de ${v.pares.length} municípios do ES com população semelhante: <strong>${reais(v.mediana_pares)}</strong>.
+      ${pp(Math.abs(p.diferenca_mediana_pct))} ${p.diferenca_mediana_pct >= 0 ? 'acima' : 'abaixo'} da mediana; ${p.ordem}º de ${p.total}, do maior para o menor.</p>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Município</th><th class="num">População</th><th class="num">RCL por habitante</th></tr></thead>
+      <tbody>${v.pares.map(x => `<tr><td>${esc(semUF(x.nome))}</td><td class="num">${num(x.populacao)}</td><td class="num">${reais(x.rcl_per_capita)}</td></tr>`).join('')}</tbody>
+    </table></div>
+    ${excluidos}
+    ${externalFooter({ ...r, note: r.note.split(' Aviso: ')[0] }, `População IBGE ${v.exercicio}`)}
+  </div>`;
+}
+
+function renderExternal() {
+  const { rcl, benchmark } = state.external;
+  const c = (benchmark.valores || {}).comparacao_estudo;
+  $('#external-notice').innerHTML = c ? `<div class="notice"><strong>Os números da planilha não são os do município real</strong>
+    <p>${esc(c.aviso)}</p></div>` : '';
+  $('#external').innerHTML = renderRcl(rcl) + renderBenchmark(benchmark);
+  annotate($('#external'));
+}
+
 
 const SLIDERS = ['recovery_pct', 'admin_pct', 'environment_pct', 'security_pct',
   'das_cut_pct', 'attrition_pct', 'temp_saving_pct', 'refis_adhesion_pct', 'refis_discount_pct'];
@@ -563,6 +650,12 @@ function renderReview() {
 
 const GLOSSARY = [
   { term: 'LRF', exact: true, text: 'Lei de Responsabilidade Fiscal. Lei federal com as regras para as contas do município, como os limites de gasto com pessoal.' },
+  { term: 'RCL ajustada', text: 'RCL depois de tirar as transferências que a LRF manda excluir. É a base dos limites de gasto com pessoal.' },
+  { term: 'limite prudencial', text: '95% do limite máximo de gasto com pessoal. Acima dele, a LRF impõe restrições ao município.' },
+  { term: 'limite de alerta', text: '90% do limite máximo de gasto com pessoal. O Tribunal de Contas avisa o município quando ele é passado.' },
+  { term: 'RGF', exact: true, text: 'Relatório de Gestão Fiscal. Demonstrativo oficial que o município publica com a despesa com pessoal e os limites da LRF.' },
+  { term: 'SICONFI', exact: true, text: 'Sistema do Tesouro Nacional onde estados e municípios publicam seus relatórios fiscais.' },
+  { term: 'mediana', text: 'Valor do meio quando os números são postos em ordem. Metade dos municípios fica acima e metade abaixo.' },
   { term: 'RCL', exact: true, text: 'Receita Corrente Líquida. Base oficial usada para calcular os limites de gasto com pessoal. A planilha não traz o valor oficial.' },
   { term: 'DAS', exact: true, text: 'Cargos de confiança (comissionados). São nomeados sem concurso e podem ser exonerados livremente.' },
   { term: 'FIFO', exact: true, text: 'Sigla em inglês para "o primeiro que entra é o primeiro que sai". Na prefeitura: quem pede primeiro, recebe primeiro.' },
@@ -675,6 +768,23 @@ $('#refresh-sources').addEventListener('click', async event => {
   }
 });
 
+$('#refresh-external').addEventListener('click', async event => {
+  const button = event.currentTarget;
+  button.disabled = true;
+  button.textContent = 'Coletando... (cerca de 20 s na primeira vez)';
+  try {
+    state.external = await api('/api/external/refresh', {});
+    renderExternal();
+    const falhas = Object.values(state.external).filter(r => r.status !== 'consultada' || r.desatualizado).length;
+    toast(falhas ? 'Coleta concluída com pendências. Confira o status de cada cartão.' : 'Dados públicos coletados.', falhas > 0);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    button.disabled = false;
+    button.textContent = 'Coletar dados públicos';
+  }
+});
+
 $('#run-history').addEventListener('change', async event => {
   const select = event.currentTarget;
   select.disabled = true;
@@ -750,6 +860,7 @@ async function init() {
     renderWarnings();
     renderTables();
     renderSources();
+    renderExternal();
     renderScenario();
     renderAI();
     renderHistory();

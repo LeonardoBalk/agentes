@@ -52,6 +52,13 @@
         <div id="situation" class="grid cols-3"></div>
       </div>
 
+      <div class="section">
+        <div class="section-head"><h2>Dados oficiais do município real</h2><button id="refresh-external" class="button secondary">Coletar dados públicos</button></div>
+        <p class="field-hint">Relatórios que Santa Leopoldina publicou no Tesouro Nacional (SICONFI) e população estimada pelo IBGE. Ficam guardados neste computador: a tela não consulta a internet sozinha.</p>
+        <div id="external-notice"></div>
+        <div id="external" class="grid cols-2"></div>
+      </div>
+
       <div class="tile section">
         <div class="section-head"><h2>Como a despesa liquidada se divide</h2><span class="tag">R$ milhões</span></div>
         <div id="spend-chart"></div>
@@ -107,7 +114,7 @@
           <div class="steps" aria-label="Como o sistema funciona">
             <div class="step"><div class="tile-label">1 · DADOS</div><p>Lê a planilha e confere as entradas.</p><code>dados.py</code></div>
             <div class="step"><div class="tile-label">2 · SIMULAÇÃO</div><p>Calcula as propostas com premissas visíveis. Só código, sem IA.</p><code>simulacao.py</code></div>
-            <div class="step"><div class="tile-label">3 · AGENTE DE IA</div><p>Um agente com três ferramentas: fontes oficiais (coleta externa), indicadores e simulação (financeiro) e folha (operacional). Ele ordena e explica; não calcula nem decide.</p><code>agente.py</code></div>
+            <div class="step"><div class="tile-label">3 · AGENTE DE IA</div><p>Um agente com quatro ferramentas: fontes oficiais (coleta externa), indicadores e simulação (financeiro), folha (operacional) e dados públicos do município real. Ele ordena e explica; não calcula nem decide.</p><code>agente.py</code></div>
             <div class="step"><div class="tile-label">4 · PESSOA</div><p>É o revisor: confere, decide e justifica. Tributação pede aprovação em nível superior.</p><code>storage.py</code></div>
           </div>
         </div>
