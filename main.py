@@ -61,7 +61,7 @@ class Application:
         # só cache: a tela inicial nunca espera rede
         return estado_coleta(self.external_cache,self.dataset['metrics']['revenue'])
 
-    def refresh_external(self,forcar=True):
+    def refresh_external(self,forcar=False):
         with self.external_lock:
             return atualizar_coleta(self.external_cache,self.dataset['metrics']['revenue'],forcar=forcar)
 
@@ -207,7 +207,10 @@ def make_handler(app: Application):
                 if path=='/api/sources/refresh':
                     return self.send(app.refresh())
                 if path=='/api/external/refresh':
-                    return self.send(app.refresh_external())
+                    # sem forcar, respeita o recuo depois de uma falha e responde na hora
+                    if set(body)-{'forcar'} or not isinstance(body.get('forcar',False),bool):
+                        raise ValueError('Parâmetros de coleta inválidos.')
+                    return self.send(app.refresh_external(body.get('forcar',False)))
                 if path=='/api/project':
                     return self.send(app.store.save_project(body))
                 if path=='/api/reviews':

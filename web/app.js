@@ -215,7 +215,8 @@ function externalHeader(label, r) {
 }
 
 function externalFooter(r, periodo) {
-  const meta = [periodo, r.checked_at ? 'Coletado em ' + date(r.checked_at) : ''].filter(Boolean).join(' · ');
+  const quando = r.checked_at ? (r.status === 'consultada' ? 'Coletado em ' : 'Última tentativa em ') + date(r.checked_at) : '';
+  const meta = [periodo, quando].filter(Boolean).join(' · ');
   return `${meta ? `<p class="field-hint">${meta}</p>` : ''}<p class="field-hint">${esc(r.note)}</p>`;
 }
 
@@ -282,6 +283,8 @@ function renderExternal() {
   $('#external-notice').innerHTML = c ? `<div class="notice"><strong>Os números da planilha não são os do município real</strong>
     <p>${esc(c.aviso)}</p></div>` : '';
   $('#external').innerHTML = renderRcl(rcl) + renderBenchmark(benchmark);
+  // "Tentar de novo agora" ignora o recuo de 5 minutos depois de uma falha; só aparece quando há falha ou dado velho.
+  $('#retry-external').hidden = ![rcl, benchmark].some(r => ['indisponivel', 'sem_dados'].includes(r.status) || r.desatualizado);
   annotate($('#external'));
 }
 
@@ -768,22 +771,28 @@ $('#refresh-sources').addEventListener('click', async event => {
   }
 });
 
-$('#refresh-external').addEventListener('click', async event => {
-  const button = event.currentTarget;
-  button.disabled = true;
-  button.textContent = 'Coletando... (cerca de 20 s na primeira vez)';
+async function refreshExternal(forcar) {
+  const buttons = [$('#refresh-external'), $('#retry-external')];
+  const label = buttons.map(b => b.textContent);
+  buttons.forEach(b => { b.disabled = true; });
+  (forcar ? buttons[1] : buttons[0]).textContent = 'Coletando... (cerca de 20 s na primeira vez)';
   try {
-    state.external = await api('/api/external/refresh', {});
+    state.external = await api('/api/external/refresh', forcar ? { forcar: true } : {});
     renderExternal();
-    const falhas = Object.values(state.external).filter(r => r.status !== 'consultada' || r.desatualizado).length;
-    toast(falhas ? 'Coleta concluída com pendências. Confira o status de cada cartão.' : 'Dados públicos coletados.', falhas > 0);
+    const partes = [state.external.rcl, state.external.benchmark];
+    const falhas = partes.filter(r => r.status !== 'consultada' || r.desatualizado).length;
+    toast(falhas === 0 ? 'Dados públicos coletados.'
+      : falhas === partes.length ? 'Não foi possível coletar agora. O motivo está em cada cartão.'
+      : 'Coleta concluída com pendências. Confira o status de cada cartão.', falhas > 0);
   } catch (e) {
     toast(e.message, true);
   } finally {
-    button.disabled = false;
-    button.textContent = 'Coletar dados públicos';
+    buttons.forEach((b, i) => { b.disabled = false; b.textContent = label[i]; });
   }
-});
+}
+
+$('#refresh-external').addEventListener('click', () => refreshExternal(false));
+$('#retry-external').addEventListener('click', () => refreshExternal(true));
 
 $('#run-history').addEventListener('change', async event => {
   const select = event.currentTarget;

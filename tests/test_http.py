@@ -144,7 +144,7 @@ class HTTPTests(unittest.TestCase):
         with patch('main.atualizar_coleta',side_effect=coletar_sem_esperar) as atualizar,\
              patch('municipal.coleta.RITMO_SICONFI',coleta.Ritmo(0)),\
              patch('municipal.coleta.urlopen',side_effect=apis_publicas):
-            coletado=self.request('/api/external/refresh',{})
+            coletado=self.request('/api/external/refresh',{'forcar':True})
         self.assertTrue(atualizar.call_args.kwargs['forcar'])
         self.assertEqual(coletado['rcl']['status'],'consultada')
         self.assertEqual(coletado['rcl']['valores']['rcl'],93_629_577.05)
@@ -156,6 +156,15 @@ class HTTPTests(unittest.TestCase):
         rede.assert_not_called()
         self.assertEqual(external,coletado)
         self.assertEqual(state['external']['rcl']['status'],'consultada')
+
+    def test_external_refresh_respects_the_backoff_unless_forced(self):
+        with patch('main.atualizar_coleta',return_value={}) as atualizar:
+            self.request('/api/external/refresh',{})
+        self.assertFalse(atualizar.call_args.kwargs['forcar'])
+        for body in ({'forcar':'sim'},{'outro':1}):
+            with self.subTest(body=body),self.assertRaises(HTTPError) as ctx:
+                self.request('/api/external/refresh',body)
+            self.assertEqual(ctx.exception.code,400)
 
     def test_demo_mode_runs_without_network_or_llm_key(self):
         sem_rede=AssertionError('o modo demonstração não usa rede')
