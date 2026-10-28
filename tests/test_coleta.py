@@ -769,6 +769,8 @@ class ColetaRedeTests(unittest.TestCase):
                        'referência de ordem de grandeza, não como comparação direta','cerca de 6,2 vezes menor'):
             self.assertIn(trecho,c['aviso'])
             self.assertIn(trecho,r['note'])
+        self.assertIn('publicada por Santa Leopoldina no RGF',c['aviso'])
+        self.assertNotIn(' - ES',c['aviso']+r['note'])
         for acusacao in ('erro','errad','incorret','falso'):
             self.assertNotIn(acusacao,c['aviso'].lower())
 

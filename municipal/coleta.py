@@ -1045,14 +1045,16 @@ def coletar_benchmark(cache: Path, receita_estudo: float | None = None, id_ente:
                    mediana_pares=mediana,
                    posicao=dict(ordem=ordem, total=len(por_capita) + 1, diferenca_mediana_pct=diferenca))
     pct = f'{abs(diferenca):.1f}'.replace('.', ',')
-    nota = (f"RCL por habitante de {municipio['nome']} em {exercicio}: {reais(valor)}. Mediana de "
+    # o IBGE devolve "Santa Leopoldina - ES"; nas notas, que vão para a tela e o relatório, só o nome.
+    nome = re.sub(r' - [A-Z]{2}$', '', municipio['nome'] or '')
+    nota = (f"RCL por habitante de {nome} em {exercicio}: {reais(valor)}. Mediana de "
             f"{len(por_capita)} municípios da UF com população semelhante: {reais(mediana)}. O município está "
             f"{pct}% {'acima' if diferenca >= 0 else 'abaixo'} da mediana, "
             f"{ordem}º de {len(por_capita) + 1} do maior para o menor valor. {r['note']}")
     if receita_estudo is not None:
         receita = valor_api(receita_estudo, 'receita do estudo de caso')
         receita_hab = centavos(receita / municipio['populacao'])
-        aviso = aviso_estudo_de_caso(municipio['nome'], exercicio, receita_hab, valor)
+        aviso = aviso_estudo_de_caso(nome, exercicio, receita_hab, valor)
         valores['comparacao_estudo'] = dict(receita_estudo=receita, receita_estudo_per_capita=receita_hab,
                                             rcl_per_capita=valor, razao=round(receita_hab / valor, 2), aviso=aviso)
         nota += ' Aviso: ' + aviso
