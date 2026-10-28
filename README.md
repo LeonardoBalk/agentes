@@ -4,7 +4,7 @@ A identidade aprovada está em `assets/branding/logo.png` (símbolo à esquerda 
 
 Protótipo de apoio à decisão para o estudo de caso da **Prefeitura de Santa Leopoldina** (trabalho final, UFSM). O app lê a planilha de receitas, despesas, dívida ativa e folha, simula cinco medidas para reduzir o déficit e entrega as propostas a uma pessoa, que aprova, recusa ou pede revisão.
 
-A arquitetura é a de **agente único com validação humana**, uma das duas permitidas pelo enunciado: um agente CrewAI com o modelo Gemini e três ferramentas. **A IA interpreta, o Python calcula e a pessoa decide.**
+A arquitetura é a de **agente único com validação humana**, uma das duas permitidas pelo enunciado: um agente CrewAI com o modelo Gemini e quatro ferramentas. **A IA interpreta, o Python calcula e a pessoa decide.**
 
 Para o estado atual do projeto e o que falta entregar, veja o [handoff.md](handoff.md).
 
@@ -64,6 +64,7 @@ flowchart LR
   P[Premissas editáveis] --> S[Python: 5 propostas, 10 anos, cenários]
   D --> S
   F[Artigos oficiais: LRF e Lei 4.320] --> A[Agente CrewAI + Gemini]
+  G[Dados publicados: SICONFI e IBGE] --> A
   D --> A
   S --> A
   A --> V[Validação pelo código]
@@ -71,10 +72,34 @@ flowchart LR
   H --> B[SQLite: versões e decisões]
 ```
 
-- **O agente** usa três ferramentas: `consultar_indicadores` (planilha, alertas e entrevista), `consultar_simulacao` (propostas, projeção, cenários, meta e alternativa) e `consultar_fontes_oficiais`. Elas correspondem aos papéis do roteiro de entrevista: o agente financeiro e o operacional viram as duas primeiras ferramentas, o de coleta externa vira a terceira, e o revisor é a pessoa.
-- **O código valida a resposta**: rejeita propostas desconhecidas ou repetidas, fontes não consultadas e respostas que não usaram as três ferramentas. Isso não garante que todo o texto esteja certo; a pessoa precisa ler.
+- **O agente** usa quatro ferramentas: `consultar_indicadores` (planilha, alertas e entrevista), `consultar_simulacao` (propostas, projeção, cenários, meta e alternativa), `consultar_fontes_oficiais` e `consultar_dados_publicos` (ver "Dados públicos do município real"). As três primeiras correspondem aos papéis do roteiro de entrevista: o agente financeiro e o operacional viram as duas primeiras ferramentas, o de coleta externa vira a terceira, e o revisor é a pessoa.
+- **O código valida a resposta**: rejeita propostas desconhecidas ou repetidas, fontes não consultadas e respostas que não usaram as quatro ferramentas. Isso não garante que todo o texto esteja certo; a pessoa precisa ler.
 - **Fontes externas**: o app recupera artigos específicos nos sites oficiais. São os arts. 14, 19, 20, 22 e 42 da LRF e os arts. 58, 62, 63 e 64 da Lei 4.320/1964, e esses trechos vão ao agente como contexto. É uma **recuperação fixa de artigos oficiais como contexto**, sem busca semântica nem banco vetorial. Do Manual de Demonstrativos Fiscais (Tesouro) só a página de apresentação é lida.
 - **Erros do provedor**: em 503 (alta demanda), limite por minuto ou demora, o app tenta o mesmo modelo de novo até três vezes. Se a cota do dia acabou (429 com espera longa), ele não insiste e passa direto para o próximo modelo da lista de reservas. Erros permanentes, como chave recusada ou modelo indisponível, aparecem com uma mensagem clara e nada é salvo como sucesso.
+
+## Dados públicos do município real
+
+O módulo `municipal/coleta.py` busca nas APIs públicas os números **publicados pela Prefeitura de Santa Leopoldina** e os mostra na tela de Situação, ao lado (nunca no lugar) dos números da planilha. Ele lê o RGF do último exercício fechado: RCL, RCL ajustada, despesa com pessoal e os três limites da LRF, com os percentuais do próprio demonstrativo. Confere a RCL com a do RREO do mesmo período e compara a RCL por habitante com a de municípios do ES de população semelhante.
+
+| Fonte | O que vem dela | Documentação |
+|---|---|---|
+| SICONFI (Tesouro Nacional) | Extrato de entregas, RGF (Anexo 01) e RREO (Anexo 03) | [API de dados abertos](https://apidatalake.tesouro.gov.br/docs/siconfi/) |
+| IBGE | População residente estimada (agregado 6579) | [API de agregados](https://servicodados.ibge.gov.br/api/docs/agregados?versao=3) |
+
+Nenhuma das duas exige chave, e não há variável nova no `.env`.
+
+- **A tela não espera a internet.** Ela lê só o que já foi coletado, guardado em `runtime/coleta.json`. O botão **Coletar dados públicos** busca o que falta ou venceu; a primeira coleta leva cerca de 20 segundos. Uma análise com o agente coleta sozinha só se não houver nada guardado.
+- **Validade:** 7 dias para o RGF, o RREO e o benchmark; 30 dias para a população do IBGE; 1 dia para o extrato de entregas, que decide qual período usar.
+- **Se a coleta falhar:** o último valor bom continua na tela, marcado como **desatualizado**, com o motivo da falha. Sem valor anterior, o cartão mostra a falha. Depois de uma falha, nada tenta de novo por 5 minutos: **Coletar dados públicos** responde na hora com o motivo, e **Tentar de novo agora** força uma nova tentativa. Sem internet, a tentativa desiste em cerca de 20 segundos.
+- **Ritmo:** o SICONFI aceita **uma requisição por segundo**, e o app espera 1,1 s entre elas. Ele aceita um município por consulta, então o benchmark faz uma requisição por município comparado.
+- **Ferramenta do agente:** `consultar_dados_publicos(indicador)`, com `indicador` igual a `rcl`, `benchmark` ou `tudo`. Ela é obrigatória. O agente só pode citar `publico_rcl` ou `publico_benchmark` se pediu esse dado e ele veio coletado.
+
+**Limitações conhecidas:**
+
+- **Os dados do estudo de caso são sintéticos e não correspondem ao município real.** A receita da planilha dá cerca de R$ 41.800 por habitante; a RCL publicada, cerca de R$ 6.800. A tela mostra esse aviso em destaque.
+- **O benchmark** compara com os 10 municípios do ES de população mais próxima e serve como referência de ordem de grandeza, não como comparação direta.
+- **O app mostra em que faixa da LRF a despesa com pessoal ficou, mas não emite parecer de conformidade.**
+- O cache guarda **uma entrada por fonte**: consultar outro município ou outro exercício substitui a anterior.
 
 ## As cinco propostas
 
@@ -139,17 +164,19 @@ main.py                 Servidor HTTP local (biblioteca padrão) e rotas da API
 municipal/
   dados.py              Leitura da planilha, indicadores e diagnóstico da situação atual
   simulacao.py          As 5 propostas, projeção de 10 anos, cenários, meta e alternativa de equilíbrio
-  agente.py             Um agente CrewAI, três ferramentas, validação da resposta, novas tentativas e modelos reserva
+  agente.py             Um agente CrewAI, quatro ferramentas, validação da resposta, novas tentativas e modelos reserva
   fontes.py             Recuperação dos artigos oficiais (LRF e Lei 4.320) e da página do MDF
+  coleta.py             Dados publicados do município (SICONFI e IBGE): rede, cache, conferência e benchmark
   storage.py            Versões das análises, decisões e entrevista em SQLite
 web/
   index.html, app.js    As quatro telas
   style.css             Visual inspirado no Carbon Design System, sem dependências externas
 data/
   estudo_municipal.xlsx Cópia da planilha fornecida (bytes idênticos ao original)
-tests/                  Testes de cálculo, API, integração CrewAI e Trello
+tests/                  Testes de cálculo, API, coleta, integração CrewAI e Trello
+  fixtures/             Respostas reais do SICONFI e do IBGE usadas pelos testes (sem rede)
 scripts/, trello/       Criação opcional do quadro Trello do grupo (ver trello/README.md)
-runtime/                Banco, cache das fontes e logs (local, fora do .zip)
+runtime/                Banco, cache das fontes e da coleta, e logs (local, fora do .zip)
 ```
 
 ## Testes
@@ -159,7 +186,7 @@ runtime/                Banco, cache das fontes e logs (local, fora do .zip)
 node --check web/app.js
 ```
 
-São 41 testes. Eles cobrem os totais da planilha, as cinco propostas, a projeção de 10 anos, os cenários, a meta e a alternativa de equilíbrio, o teto do Refis, a aprovação superior, a recuperação de artigos, as novas tentativas em erro do provedor, a cadeia de modelos reserva (inclusive a cota diária esgotada), o caminho do Groq, a API e a exportação. O teste de integração usa o **CrewAI de verdade contra um LLM local simulado**, sem chave nem custo; ele confirma o fluxo de ferramentas, não a qualidade de um modelo real.
+São 134 testes. Eles cobrem os totais da planilha, as cinco propostas, a projeção de 10 anos, os cenários, a meta e a alternativa de equilíbrio, o teto do Refis, a aprovação superior, a recuperação de artigos, as novas tentativas em erro do provedor, a cadeia de modelos reserva (inclusive a cota diária esgotada), o caminho do Groq, a API e a exportação, e a coleta de dados públicos (leitura das respostas reais salvas em `tests/fixtures/`, novas tentativas, ritmo, paginação, cache, benchmark e a ferramenta do agente), sempre sem rede. O teste de integração usa o **CrewAI de verdade contra um LLM local simulado**, sem chave nem custo; ele confirma o fluxo de ferramentas, não a qualidade de um modelo real.
 
 ### Modelos testados (17 a 19/10/2026)
 
@@ -183,3 +210,4 @@ A ordem das propostas muda entre execuções, como é normal num modelo de lingu
 - STF, Tema 612 (RE 658.026): requisitos da contratação temporária.
 - [CrewAI: agentes](https://docs.crewai.com/en/concepts/agents), [ferramentas](https://docs.crewai.com/en/learn/create-custom-tools) e [conexão a LLMs](https://docs.crewai.com/en/learn/llm-connections)
 - [Carbon Design System](https://carbondesignsystem.com), referência visual.
+- [API de dados abertos do SICONFI](https://apidatalake.tesouro.gov.br/docs/siconfi/) (Tesouro Nacional) e [API de agregados do IBGE](https://servicodados.ibge.gov.br/api/docs/agregados?versao=3).
