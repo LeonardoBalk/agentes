@@ -1,6 +1,6 @@
 # Handoff do LeopoldinAI
 
-Estado em **19/10/2026**. Nossa entrega final é **04/11/2026, às 23h55**: depois disso, relatório e apresentação ficam bloqueados.
+Estado em **19/10/2026**, com a coleta de dados públicos do Lorenzo incorporada em 29/10. Nossa entrega final é **04/11/2026, às 23h55**: depois disso, relatório e apresentação ficam bloqueados.
 
 Escrevi este documento para passar o projeto para vocês: o que deixei pronto, o que ainda falta, por que fiz algumas escolhas e onde costuma dar problema. Para instalar e usar o app, vejam o [README.md](README.md).
 
@@ -12,7 +12,7 @@ Deixei a parte de software pronta e testada. **O trabalho ainda não está pront
 |---|---|
 | Arquitetura de agentes (agente único com validação humana) | ✅ Implementada |
 | Análise da planilha e pontos críticos | ✅ Implementada |
-| Informações externas | ✅ Artigos da LRF e da Lei 4.320 recuperados nos sites oficiais |
+| Informações externas | ✅ Artigos da LRF e da Lei 4.320 recuperados nos sites oficiais; dados publicados pelo município (SICONFI e IBGE) e comparação com 10 municípios do ES |
 | Entrevista com o cliente | ✅ Feita em 15/10/2026; cadastrei as respostas no app |
 | Resultados quantitativos | ✅ Calculados; o plano-base não fecha o déficit recorrente (ver abaixo) |
 | Fluxo de revisão humana | ✅ Funciona; ❌ falta registrarmos decisões reais |
@@ -40,6 +40,10 @@ Ficam em `runtime/municipal.sqlite3` e aparecem no seletor da tela de Revisão.
 | `529004d0`, `754be8bb`, `dd63d7a2` | 16 e 17/10 | Demonstração | Versões antigas, de quando o app tinha 2 propostas. Uma tem uma decisão de teste. Podem ignorar. |
 | `c8ea0a14` | 18/10 | Agente de IA (Gemini) | Plano-base com as 5 propostas, sem decisões. É anterior à meta de equilíbrio. |
 | `9f1f014f` | 19/10 | Agente de IA (Gemini) | Gerada com as três hipóteses principais em 100% (cortar todos os cargos de confiança, todos pagarem). Os valores são irreais. **Não usem.** |
+| `0edc75ce`, `f4005fa6`, `3262d6bb` | 19/10 | Demonstração e Gemini | Testes com outra combinação (corte de 27%, recuperação de 50%, adesão ao Refis de 15%). Não é a alternativa de 32%. |
+| `2aa47af2` | 19/10 | Gemini Flash-Lite (reserva) | Plano-base, com decisões de **teste** ("TESTE") nas 5 propostas. Não usem como decisão real. |
+
+Todas essas análises são anteriores à quarta ferramenta (`consultar_dados_publicos`). Precisamos gerar uma nova.
 
 Em 19/10 tentei duas vezes gerar a análise da alternativa de 32%, e nas duas o Google respondeu com erro 503 (alta demanda). Depois descobri outro limite: o plano gratuito do Gemini Flash aceita só cerca de **20 requisições por dia**, umas 3 a 5 análises, e a cota acabou. Por isso coloquei **modelos reserva**: se o principal falhar, o app tenta o Gemini Flash-Lite e depois o Groq (ver a tabela de decisões). Ainda falta gerar a análise da alternativa pela tela.
 
@@ -65,7 +69,7 @@ Saem da planilha e das hipóteses padrão, e dá para conferir todos na tela.
 
 | Decisão | Motivo |
 |---|---|
-| Agente único com validação humana, não multiagente | O enunciado aceita os dois. Como os números já saem do Python, vários agentes só reescreveriam o mesmo texto, com mais falhas e mais tempo. As três ferramentas cobrem os papéis do roteiro (financeiro, operacional e coleta externa), e o revisor é a pessoa. |
+| Agente único com validação humana, não multiagente | O enunciado aceita os dois. Como os números já saem do Python, vários agentes só reescreveriam o mesmo texto, com mais falhas e mais tempo. As quatro ferramentas cobrem os papéis do roteiro (financeiro, operacional e coleta externa, esta com as leis e os dados públicos), e o revisor é a pessoa. |
 | O Python calcula; a IA só ordena e explica | Os números ficam reproduzíveis e testáveis. A IA não inventa valores nem propostas, e o código rejeita respostas fora das regras. |
 | Gemini `gemini-3.5-flash` como principal | É o modelo que melhor seguiu as regras com os dados completos. A família 2.5 recusa contas novas. Tirei a DeepSeek do projeto. |
 | Reservas: Gemini `3.5-flash-lite` e Groq `gpt-oss-120b` | A cota gratuita do Flash acaba rápido e o Google às vezes fica sobrecarregado. O Flash-Lite passou em 4 de 4 testes, usa a mesma chave e tem cota própria. O Groq também passou em 4 de 4, mas no plano gratuito só aceita 8.000 tokens por minuto, então recebe dados resumidos e leva uns 2 minutos. O `3.1-flash-lite` foi descartado: inventou propostas e fontes sem consultar as ferramentas. |
@@ -94,7 +98,7 @@ Saem da planilha e das hipóteses padrão, e dá para conferir todos na tela.
 node --check web/app.js
 ```
 
-O resultado esperado é **41 testes, OK**. Depois abram o app e confiram se o selo do canto mostra "Agente de IA ligado" e se a tela de Simulação mostra a alternativa de 32%.
+O resultado esperado é **134 testes, OK**. Depois abram o app e confiram se o selo do canto mostra "Agente de IA ligado" e se a tela de Simulação mostra a alternativa de 32%.
 
 ## Onde está cada coisa
 
@@ -104,6 +108,7 @@ O resultado esperado é **41 testes, OK**. Depois abram o app e confiram se o se
 | Instruções e validação do agente | `municipal/agente.py` |
 | Leitura da planilha e diagnóstico | `municipal/dados.py` |
 | Artigos oficiais consultados | `municipal/fontes.py` e o cache em `runtime/sources.json` |
+| Dados públicos do município (SICONFI e IBGE) | `municipal/coleta.py` e o cache em `runtime/coleta.json` |
 | Perguntas da entrevista | `municipal/storage.py` (`QUESTIONS`) |
 | Telas | `web/index.html`, `web/app.js`, `web/style.css` |
 | Plano de tarefas do grupo (16 cartões) | `trello/plano.json` e `trello/README.md` |

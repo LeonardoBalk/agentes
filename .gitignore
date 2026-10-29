@@ -6,3 +6,5 @@ runtime/
 .pytest_cache/
 *.log
 municipal-lab.zip
+output/
+tmp/
